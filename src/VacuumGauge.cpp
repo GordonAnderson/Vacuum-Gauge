@@ -34,6 +34,7 @@
 #include <TFT_eSPI.h>   // Graphics and font library, configured for the GC9A01 panel
 #include <SPI.h>
 #include <Wire.h>
+#include <WiFi.h>       // STA-mode WiFi + TCP server for the wireless command link
 
 #include <Button.h>
 #include <RingBuffer.h>
@@ -107,6 +108,10 @@ static const int kCalSnapCounts = 100;
 // Raw samples averaged when capturing a calibration point.
 static const int kCalAvgSamples = 8;
 
+// Default TCP port for the wireless command link (telnet-style; matches the
+// usual default of TCP-to-virtual-COM bridges).
+static const int kDefaultTcpPort = 23;
+
 const char *Version = "Vacuum Gauge, version 1.0 Feb 3, 2024";
 
 // ---------------------------------------------------------------------------
@@ -125,6 +130,9 @@ typedef struct
   int           offsetTorr;      // Coarse zero offset, Torr
   int           offsetmTorr;     // Fine zero offset, mTorr
   int           useCalTable;     // 0 = factory micron formula, 1 = PWL cal table
+  char          ssid[33];        // WiFi STA SSID  (max 32 chars + NUL)
+  char          pass[65];        // WiFi STA password (max 64 chars + NUL)
+  int           tcpPort;         // TCP port for the wireless command link
   int           calCount;        // Number of valid entries in calTable
   CalPoint      calTable[CAL_MAX_POINTS]; // Field-editable raw->Torr cal points
 } Data;
@@ -135,7 +143,10 @@ Data data =
   0x50,
   0, 0, 0,
   0, 0,
-  0                              // useCalTable: default to factory formula
+  0,                             // useCalTable: default to factory formula
+  "", "",                        // ssid, pass: empty until configured
+  kDefaultTcpPort                // tcpPort
+  // calCount, calTable: zero-initialised; seeded with defaults on first boot
 };
 
 // Snapshot of the last values written to flash, used to detect changes.
@@ -155,6 +166,35 @@ auto     timer = timer_create_default();
 
 // True once SPIFFS has mounted successfully (set in setup()).
 static bool spiffsReady = false;
+
+// Wireless command link: a TCP server plus one persistent client. The client
+// object is registered with cp once; new connections are adopted into it so the
+// registered Stream pointer stays valid across connect/disconnect.
+WiFiServer wifiServer(kDefaultTcpPort);
+WiFiClient wifiClient;
+
+// (Re)start WiFi in STA mode using the stored credentials and (re)open the TCP
+// server on the configured port. No-op if no SSID is configured yet.
+static void startWiFi(void)
+{
+  if(strlen(data.ssid) == 0) return;     // nothing configured - stay offline
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(data.ssid, data.pass);      // non-blocking; status polled later
+  wifiServer.end();
+  wifiServer.begin(data.tcpPort);
+}
+
+// Adopt a newly arrived TCP client into the persistent wifiClient. Called every
+// loop; cheap when nothing is pending. processStreams() handles the actual I/O.
+static void serviceWiFi(void)
+{
+  if(WiFi.status() != WL_CONNECTED) return;
+  if(!wifiClient.connected())
+  {
+    WiFiClient incoming = wifiServer.available();
+    if(incoming) { wifiClient.stop(); wifiClient = incoming; }
+  }
+}
 
 // Forward declarations for calibration helpers used by the command handlers
 // below (definitions appear further down).
@@ -178,6 +218,56 @@ void loadSettings(void)
   if(!cp.checkExpectedArgs(0)) return;
   if(loadData()) cp.sendACK();
   else           cp.sendNAK();
+}
+
+// ---- WiFi commands --------------------------------------------------------
+
+// SSID         -> report the configured WiFi SSID
+// SSID,<text>  -> set it. Bounded copy (the CMDstr path uses an unbounded strcpy,
+//                 so credentials are handled here instead).
+void wifiSsid(void)
+{
+  if(cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.ssid); return; }
+  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+  char *v;
+  if(!cp.getValue(&v)) { cp.sendNAK(); return; }
+  strncpy(data.ssid, v, sizeof(data.ssid) - 1);
+  data.ssid[sizeof(data.ssid) - 1] = '\0';
+  cp.sendACK();
+}
+
+// PASS / PASS,<text> - report / set the WiFi password (bounded copy).
+void wifiPass(void)
+{
+  if(cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.pass); return; }
+  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+  char *v;
+  if(!cp.getValue(&v)) { cp.sendNAK(); return; }
+  strncpy(data.pass, v, sizeof(data.pass) - 1);
+  data.pass[sizeof(data.pass) - 1] = '\0';
+  cp.sendACK();
+}
+
+// WIFICONN - apply the stored credentials/port: (re)connect and (re)open the
+// TCP server. Settings are persisted first so they survive a reboot.
+void wifiConn(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  saveData();
+  lastSaved = data;
+  startWiFi();
+  cp.sendACK();
+}
+
+// WIFI - report the wireless link status (SSID, connection state, IP, port).
+void wifiStatus(void)
+{
+  if(!cp.checkExpectedArgs(0)) return;
+  cp.sendACK(false);
+  cp.print("SSID: ");      cp.println(data.ssid);
+  cp.print("Connected: "); cp.println(WiFi.status() == WL_CONNECTED);
+  cp.print("IP: ");        cp.println(WiFi.localIP().toString().c_str());
+  cp.print("Port: ");      cp.println(data.tcpPort);
 }
 
 // ---- Calibration commands -------------------------------------------------
@@ -274,6 +364,11 @@ Command cmds[] =
   {"CALCLEAR", CMDfunction, 0,  (void *)calClear,            NULL, "Clear the calibration table"},
   {"CALDEF",   CMDfunction, 0,  (void *)calDefaults,         NULL, "Restore factory default cal table"},
   {"CALDUMP",  CMDfunction, 0,  (void *)calDump,             NULL, "List the calibration table"},
+  {"SSID",     CMDfunction, -1, (void *)wifiSsid,            NULL, "Get/set WiFi SSID (SSID or SSID,<text>)"},
+  {"PASS",     CMDfunction, -1, (void *)wifiPass,            NULL, "Get/set WiFi password (PASS or PASS,<text>)"},
+  {"?WPORT",   CMDint,      -1, (void *)&data.tcpPort,       NULL, "Get/set TCP port for the wireless link"},
+  {"WIFICONN", CMDfunction, 0,  (void *)wifiConn,            NULL, "Save WiFi settings and (re)connect"},
+  {"WIFI",     CMDfunction, 0,  (void *)wifiStatus,          NULL, "Report WiFi status (SSID, IP, port)"},
   {NULL}
 };
 static CommandList cmdList = {cmds, NULL};
@@ -293,9 +388,12 @@ static bool settingsChanged(void)
   return data.offsetTorr  != lastSaved.offsetTorr  ||
          data.offsetmTorr != lastSaved.offsetmTorr ||
          data.useCalTable != lastSaved.useCalTable ||
+         data.tcpPort     != lastSaved.tcpPort     ||
          data.TWIadd      != lastSaved.TWIadd      ||
          data.Rev         != lastSaved.Rev         ||
-         strncmp(data.Name, lastSaved.Name, sizeof(data.Name)) != 0;
+         strncmp(data.Name, lastSaved.Name, sizeof(data.Name)) != 0 ||
+         strncmp(data.ssid, lastSaved.ssid, sizeof(data.ssid)) != 0 ||
+         strncmp(data.pass, lastSaved.pass, sizeof(data.pass)) != 0;
 }
 
 // Debug command: report the latest raw pressure count.
@@ -621,6 +719,7 @@ void setup()
   Serial.setDebugOutput(true);
 
   cp.registerStream(&Serial);
+  cp.registerStream(&wifiClient);   // 2nd command stream over the wireless link
   cp.registerCommands(&cmdList);
   cp.registerCommands(dbg.debugCommands());
   dbg.registerDebugFunction(Debug);
@@ -640,6 +739,8 @@ void setup()
   }
   lastSaved = data;
 
+  startWiFi();   // connect with stored credentials (no-op if none configured)
+
   timer.every(kReadIntervalMs, readPressure);
   timer.every(kSaveIntervalMs, saveChanges);
 }
@@ -647,6 +748,7 @@ void setup()
 void loop()
 {
   timer.tick();
+  serviceWiFi();          // adopt any new TCP client before reading streams
   cp.processStreams();
   cp.processCommands();
 
