@@ -182,6 +182,7 @@ static bool addCalPoint(int raw, float torr);
 static void loadDefaultCalTable(void);
 static bool settingsChanged(void);
 static void setupServer(void);
+extern Command cmds[]; 
 
 // ---------------------------------------------------------------------------
 // Persistence (NVS via Preferences)
@@ -950,14 +951,51 @@ void Debug()
     cp.println(data.rawData);
 }
 
+void cmdNop()
+{
+    // MIPS sends NOP as a keepalive — just ACK it
+    cp.sendACK();
+}
+
+void cmdGetName()
+{
+    if (cp.getNumArgs() == 0)
+    {
+        cp.sendACK(false);
+        cp.println(data.Name);
+        return;
+    }
+    if (cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+    char *v;
+    if (!cp.getValue(&v)) { cp.sendNAK(); return; }
+    strncpy(data.Name, v, sizeof(data.Name) - 1);
+    data.Name[sizeof(data.Name) - 1] = '\0';
+    cp.sendACK();
+}
+
+void cmdGetCmds()
+{
+    if (!cp.checkExpectedArgs(0)) return;
+    cp.sendACK(false);
+    for (int i = 0; cmds[i].name != NULL; i++)
+    {
+        cp.print(cmds[i].name);
+        cp.print(",");
+        cp.println(cmds[i].help);
+    }
+}
 // ---------------------------------------------------------------------------
 // Command table
 // ---------------------------------------------------------------------------
 
 Command cmds[] =
 {
+    {"NOP",      CMDfunction,  0, (void *)cmdNop,             NULL, "No operation"},
     {"GVER",     CMDstr,       0, (void *)Version,            NULL, "Firmware version"},
-    {"?NAME",    CMDstr,      -1, (void *)&data.Name,         NULL, "Device name"},
+    {"GNAME",    CMDfunction, -1, (void *)cmdGetName,         NULL, "Get/set device name"},
+    {"SNAME",    CMDfunction,  1, (void *)cmdGetName,         NULL, "Set device name"},
+    {"GCMDS",    CMDfunction,  0, (void *)cmdGetCmds,         NULL, "List all commands"},
+    {"?NAME",    CMDstr,      -1, (void *)&data.Name,         NULL, "Device name (legacy)"},
     {"LOAD",     CMDfunction,  0, (void *)loadSettings,       NULL, "Load saved parameters from NVS"},
     {"SAVE",     CMDfunction,  0, (void *)saveSettings,       NULL, "Save parameters to NVS"},
     {"GPRES",    CMDdouble,    0, (void *)&data.calPress,     NULL, "Return pressure in Torr"},
