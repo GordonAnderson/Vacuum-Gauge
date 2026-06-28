@@ -1,376 +1,857 @@
 //
 // VacuumGauge.cpp
 //
-// Vacuum pressure gauge built around a Posifa pressure sensor with an I2C
-// interface. The firmware targets a LILYGO T-QT Pro (ESP32-S3) with a
-// 128 x 128 GC9A01 TFT, driven through TFT_eSPI.
+// Vacuum pressure gauge for Waveshare ESP32-S3-Touch-AMOLED-1.64
+// (CO5300 QSPI AMOLED, 280x456).
 //
-// Responsibilities:
-//   - Periodically read the sensor over I2C and convert the reading to Torr.
-//   - Display the pressure on the TFT, auto-ranging between Torr and mTorr.
-//   - Apply user-trimmable zero offsets (coarse Torr / fine mTorr) set via the
-//     two on-board buttons or serial commands.
-//   - Persist the configuration to SPIFFS and reload it on boot.
-//   - Expose a serial command interface (see the command table below).
-//
-// Arduino IDE board settings used for reference (PlatformIO mirrors these via
-// the lilygo-t3-s3 board definition):
-//   Board:            ESP32S3 Dev Module
-//   USB CDC On Boot:  Enabled
-//   CPU Frequency:    240MHz (WiFi)
-//   Flash Mode:       QIO 80MHz
-//   Flash Size:       4MB (32Mb)
-//   Partition Scheme: Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)
-//   Upload Speed:     921600
-//   USB Mode:         Hardware CDC and JTAG
+// Sensor:   Posifa I2C @ 0x50, SDA=GPIO1, SCL=GPIO2
+// Display:  Arduino_GFX + Arduino_Canvas (offscreen framebuffer flushed per frame)
+// Storage:  Preferences (NVS), namespace "vacgauge"
+// WiFi:     Captive-portal AP on first boot; STA + HTTP REST API thereafter
+// Commands: USB Serial at 115200 via GAACE_Core commandProcessor
 //
 
 #include <Arduino.h>
-#include <string.h>
-
-#include "FS.h"
-#include "SPIFFS.h"
-
-#include <TFT_eSPI.h>   // Graphics and font library, configured for the GC9A01 panel
-#include <SPI.h>
 #include <Wire.h>
-#include <WiFi.h>       // STA-mode WiFi + TCP server for the wireless command link
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include <Arduino_GFX_Library.h>
 
-#include <Button.h>
-#include <RingBuffer.h>
 #include <commandProcessor.h>
-#include <charAllocate.h>
 #include <debug.h>
-
-#include <arduino-timer.h>
+#include <RingBuffer.h>
+#include <charAllocate.h>
 
 #include "VacuumGauge.h"
 #include "build_info.h"
 
 // ---------------------------------------------------------------------------
+// Pin definitions
+// ---------------------------------------------------------------------------
+
+// QSPI display (verified against GFX library Arduino_GFX_dev_device.h for this board)
+static const int8_t kQSPI_CS    = 9;
+static const int8_t kQSPI_SCLK  = 10;
+static const int8_t kQSPI_SDIO0 = 11;
+static const int8_t kQSPI_SDIO1 = 12;
+static const int8_t kQSPI_SDIO2 = 13;
+static const int8_t kQSPI_SDIO3 = 14;
+static const int8_t kQSPI_RST   = 21;
+
+static const int16_t kScreenW = 280;
+static const int16_t kScreenH = 456;
+
+// I2C sensor
+static const int  kI2C_SDA = 1;
+static const int  kI2C_SCL = 2;
+static const long kI2C_Hz  = 100000;
+
+// Boot button (active LOW)
+static const uint8_t       kBootPin         = 0;
+static const unsigned long kBootLongPressMs = 3000;
+
+// ---------------------------------------------------------------------------
 // Configuration constants
 // ---------------------------------------------------------------------------
 
-// Format SPIFFS automatically if the partition fails to mount on first boot.
-#define FORMAT_SPIFFS_IF_FAILED true
+static const int   kSensorBytes      = 6;
+static const int   kSensorAddr       = 0x50;
 
-static const char *kSettingsFile = "/Default.dat";
+static const float kTorrThreshold    = 10.0f;
+static const float kTrendKnee        = 50000.0f;
+static const float kMicronsPerCount  = 45.7f;
+static const float kMinPressure      = 0.0f;
 
-// TFT geometry (the panel is square).
-static const uint16_t screenWidth  = 128;
-static const uint16_t screenHeight = 128;
+static const int   kMaxOffsetTorr    = 700;
+static const int   kMaxOffsetmTorr   = 10000;
 
-// I2C bus pins for the sensor (T-QT Pro Qwiic/STEMMA header) and bus speed.
-static const int  kI2C_SDA      = 43;
-static const int  kI2C_SCL      = 44;
-static const long kI2C_Hz       = 100000;
-static const int  kSensorBytes  = 6;     // Bytes returned by each sensor read
+#define CAL_MAX_POINTS 32
+static const int kCalSnapCounts = 100;
+static const int kCalAvgSamples = 8;
 
-// Periodic task intervals (milliseconds).
 static const unsigned long kReadIntervalMs = 500;
 static const unsigned long kSaveIntervalMs = 10000;
 
-// On-board buttons (GPIO numbers). Each press nudges the active zero offset.
-static const uint8_t kButtonA_Pin = 0;
-static const uint8_t kButtonB_Pin = 47;
-
-// Pressure threshold (Torr) that selects which offset trim and which display
-// units (Torr vs mTorr region) are in effect.
-static const float kTorrThreshold = 10.0f;
-
-// Posifa sensor characteristic: counts 50000..65535 are "trend only" data and
-// map to 50000..760000 microns, i.e. ~45.7 microns per count above 50000.
-static const float kTrendKnee       = 50000.0f;
-static const float kMicronsPerCount = 45.7f;
-
-// Absolute pressure floor (Torr). Reported/displayed pressure is clamped here so
-// a negative zero-offset or near-vacuum sensor noise can never show as negative.
-static const float kMinPressure     = 0.0f;
-
-// Bounds on the user zero-offset trims (symmetric about zero), so repeated
-// button presses - or out-of-range serial command values - can't drive the
-// calibration into nonsense.
-static const int kMaxOffsetTorr     = 700;    // +/- Torr  (coarse trim)
-static const int kMaxOffsetmTorr    = 10000;   // +/- mTorr (fine trim)
-
-// Field-editable PWL calibration table. The active table lives in Data so it
-// persists to flash; these constants size and govern it.
-#define CAL_MAX_POINTS 32                      // Maximum calibration points
-
-typedef struct
-{
-  int   raw;     // Raw sensor count (as returned by GRPRES / data.rawData)
-  float torr;    // Corresponding pressure, Torr
-} CalPoint;
-
-// A new point within this many raw counts of an existing one replaces it
-// instead of adding a near-duplicate.
-static const int kCalSnapCounts = 100;
-// Raw samples averaged when capturing a calibration point.
-static const int kCalAvgSamples = 8;
-
-// Default TCP port for the wireless command link (telnet-style; matches the
-// usual default of TCP-to-virtual-COM bridges).
-static const int kDefaultTcpPort = 23;
-
 const char *Version = "Vacuum Gauge, version " FIRMWARE_VERSION "_" BUILD_TIMESTAMP;
 
+// Captive portal AP
+static const char      *kApSSID = "VacuumGauge-Setup";
+static const IPAddress  kApIP(192, 168, 4, 1);
+
+// RGB565 display colors (avoid relying on Arduino_GFX macro exports)
+static const uint16_t C_BLACK  = 0x0000u;
+static const uint16_t C_WHITE  = 0xFFFFu;
+static const uint16_t C_YELLOW = 0xFFE0u;
+static const uint16_t C_CYAN   = 0x07FFu;
+static const uint16_t C_GREEN  = 0x07E0u;
+static const uint16_t C_LGRAY  = 0x7BEFu;
+
 // ---------------------------------------------------------------------------
-// Persistent data structure
+// Data structures
 // ---------------------------------------------------------------------------
 
 typedef struct
 {
-  int16_t       Size;            // sizeof(Data); used to validate a loaded file
-  char          Name[20];        // Board name, "Press"
-  int8_t        Rev;             // Board revision number
-  int           TWIadd;          // Sensor I2C address
-  double        calPress;        // Last computed pressure, Torr  (live, not persisted intent)
-  int           rawData;         // Last raw pressure counts      (live)
-  int           rawTemp;         // Last raw temperature counts   (live)
-  int           offsetTorr;      // Coarse zero offset, Torr
-  int           offsetmTorr;     // Fine zero offset, mTorr
-  int           useCalTable;     // 0 = factory micron formula, 1 = PWL cal table
-  char          ssid[33];        // WiFi STA SSID  (max 32 chars + NUL)
-  char          pass[65];        // WiFi STA password (max 64 chars + NUL)
-  int           tcpPort;         // TCP port for the wireless command link
-  int           calCount;        // Number of valid entries in calTable
-  CalPoint      calTable[CAL_MAX_POINTS]; // Field-editable raw->Torr cal points
+    int   raw;
+    float torr;
+} CalPoint;
+
+typedef struct
+{
+    int16_t  Size;
+    char     Name[20];
+    int8_t   Rev;
+    int      TWIadd;
+    double   calPress;
+    int      rawData;
+    int      rawTemp;
+    int      offsetTorr;
+    int      offsetmTorr;
+    int      useCalTable;
+    char     ssid[33];
+    char     pass[65];
+    int      calCount;
+    CalPoint calTable[CAL_MAX_POINTS];
 } Data;
 
 Data data =
 {
-  sizeof(Data), "Press", 1,
-  0x50,
-  0, 0, 0,
-  0, 0,
-  0,                             // useCalTable: default to factory formula
-  "", "",                        // ssid, pass: empty until configured
-  kDefaultTcpPort                // tcpPort
-  // calCount, calTable: zero-initialised; seeded with defaults on first boot
+    sizeof(Data), "Press", 1,
+    kSensorAddr,
+    0, 0, 0,
+    0, 0,
+    0,
+    "", "",
+    0
 };
 
-// Snapshot of the last values written to flash, used to detect changes.
 Data lastSaved;
 
 // ---------------------------------------------------------------------------
-// Globals
+// App state
 // ---------------------------------------------------------------------------
+
+enum AppState { STATE_PORTAL, STATE_CONNECTING, STATE_RUNNING };
+static AppState appState = STATE_PORTAL;
+
+// ---------------------------------------------------------------------------
+// Global objects
+// ---------------------------------------------------------------------------
+
+static Arduino_DataBus *bus =
+    new Arduino_ESP32QSPI(kQSPI_CS, kQSPI_SCLK, kQSPI_SDIO0,
+                          kQSPI_SDIO1, kQSPI_SDIO2, kQSPI_SDIO3);
+// Constructor: (bus, rst, rotation, w, h, col_offset1, row_offset1, col_offset2, row_offset2)
+// Offsets from GFX library board reference — required to map the physical pixel array correctly.
+static Arduino_GFX    *display = new Arduino_CO5300(
+    bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
+static Arduino_Canvas *canvas  = new Arduino_Canvas(kScreenW, kScreenH, display, 0, 0, 0);
+
+static AsyncWebServer server(80);
+static DNSServer      dnsServer;
 
 commandProcessor cp;
 debug            dbg(&cp);
-Button           buttonA(kButtonA_Pin);
-Button           buttonB(kButtonB_Pin);
 
-TFT_eSPI tft = TFT_eSPI();             // Pins/driver defined in the User_Setup
-auto     timer = timer_create_default();
+static SemaphoreHandle_t dataMutex;   // guards calPress, rawData, rawTemp
+static SemaphoreHandle_t wireMutex;   // guards Wire I2C bus
 
-// True once SPIFFS has mounted successfully (set in setup()).
-static bool spiffsReady = false;
+static unsigned long bootPressStart  = 0;
+static bool          bootWasPressed  = false;
+static unsigned long lastDisplayMs   = 0;
+static unsigned long lastSaveMs      = 0;
+static unsigned long connectStartMs  = 0;
+static volatile bool restartPending  = false;
 
-// Wireless command link: a TCP server plus one persistent client. The client
-// object is registered with cp once; new connections are adopted into it so the
-// registered Stream pointer stays valid across connect/disconnect.
-WiFiServer wifiServer(kDefaultTcpPort);
-WiFiClient wifiClient;
+// Body accumulator for POST /save (file-scope so lambdas can reference it)
+static char   s_saveBody[512];
+static size_t s_saveBodyLen = 0;
 
-// (Re)start WiFi in STA mode using the stored credentials and (re)open the TCP
-// server on the configured port. No-op if no SSID is configured yet.
-static void startWiFi(void)
-{
-  if(strlen(data.ssid) == 0) return;     // nothing configured - stay offline
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(data.ssid, data.pass);      // non-blocking; status polled later
-  wifiServer.end();
-  wifiServer.begin(data.tcpPort);
-}
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
 
-// Adopt a newly arrived TCP client into the persistent wifiClient. Called every
-// loop; cheap when nothing is pending. processStreams() handles the actual I/O.
-static void serviceWiFi(void)
-{
-  if(WiFi.status() != WL_CONNECTED) return;
-  if(!wifiClient.connected())
-  {
-    WiFiClient incoming = wifiServer.available();
-    if(incoming) { wifiClient.stop(); wifiClient = incoming; }
-  }
-}
-
-// Forward declarations for calibration helpers used by the command handlers
-// below (definitions appear further down).
 static int  sampleRawAveraged(int samples);
 static bool addCalPoint(int raw, float torr);
 static void loadDefaultCalTable(void);
+static bool settingsChanged(void);
+static void setupServer(void);
+
+// ---------------------------------------------------------------------------
+// Persistence (NVS via Preferences)
+// ---------------------------------------------------------------------------
+
+bool saveData()
+{
+    Preferences p;
+    if (!p.begin("vacgauge", false)) return false;
+    p.putInt("toff",    data.offsetTorr);
+    p.putInt("mtoff",   data.offsetmTorr);
+    p.putInt("calmode", data.useCalTable);
+    p.putString("name", data.Name);
+    p.putString("ssid", data.ssid);
+    p.putString("pass", data.pass);
+    p.putInt("calcnt",  data.calCount);
+    for (int i = 0; i < data.calCount; i++)
+    {
+        char k[6];
+        snprintf(k, sizeof(k), "cr%d", i);
+        p.putInt(k, data.calTable[i].raw);
+        snprintf(k, sizeof(k), "ct%d", i);
+        p.putFloat(k, data.calTable[i].torr);
+    }
+    p.end();
+    return true;
+}
+
+bool loadData()
+{
+    Preferences p;
+    if (!p.begin("vacgauge", true)) return false;
+    if (!p.isKey("toff")) { p.end(); return false; }
+
+    data.offsetTorr  = p.getInt("toff",    0);
+    data.offsetmTorr = p.getInt("mtoff",   0);
+    data.useCalTable = p.getInt("calmode", 0);
+
+    String nm = p.getString("name", "Press");
+    strncpy(data.Name, nm.c_str(), sizeof(data.Name) - 1);
+    data.Name[sizeof(data.Name) - 1] = '\0';
+
+    String ss = p.getString("ssid", "");
+    strncpy(data.ssid, ss.c_str(), sizeof(data.ssid) - 1);
+    data.ssid[sizeof(data.ssid) - 1] = '\0';
+
+    String pw = p.getString("pass", "");
+    strncpy(data.pass, pw.c_str(), sizeof(data.pass) - 1);
+    data.pass[sizeof(data.pass) - 1] = '\0';
+
+    data.calCount = p.getInt("calcnt", 0);
+    if (data.calCount > CAL_MAX_POINTS) data.calCount = CAL_MAX_POINTS;
+    for (int i = 0; i < data.calCount; i++)
+    {
+        char k[6];
+        snprintf(k, sizeof(k), "cr%d", i);
+        data.calTable[i].raw  = p.getInt(k, 0);
+        snprintf(k, sizeof(k), "ct%d", i);
+        data.calTable[i].torr = p.getFloat(k, 0.0f);
+    }
+    p.end();
+    return true;
+}
+
+static void clearCredentials()
+{
+    Preferences p;
+    if (p.begin("vacgauge", false))
+    {
+        p.remove("ssid");
+        p.remove("pass");
+        p.end();
+    }
+    data.ssid[0] = '\0';
+    data.pass[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Calibration table
+// ---------------------------------------------------------------------------
+
+static const CalPoint defaultCalTable[] =
+{
+    {18836, 760.00f}, {21012, 28.90f}, {21916, 18.70f},
+    {24386,   8.57f}, {25868,  5.94f}, {27390,  4.14f},
+    {28354,   3.39f}, {29279,  2.77f}, {30015,  2.38f},
+    {30556,   2.08f}, {30777,  1.97f}, {31484,  1.70f},
+};
+static const int defaultCalCount = sizeof(defaultCalTable) / sizeof(defaultCalTable[0]);
+
+static void loadDefaultCalTable()
+{
+    data.calCount = defaultCalCount;
+    for (int i = 0; i < defaultCalCount; i++) data.calTable[i] = defaultCalTable[i];
+}
+
+static void sortCalTable()
+{
+    for (int i = 1; i < data.calCount; i++)
+    {
+        CalPoint key = data.calTable[i];
+        int j = i - 1;
+        while (j >= 0 && data.calTable[j].raw > key.raw)
+        {
+            data.calTable[j + 1] = data.calTable[j];
+            j--;
+        }
+        data.calTable[j + 1] = key;
+    }
+}
+
+static bool addCalPoint(int raw, float torr)
+{
+    for (int i = 0; i < data.calCount; i++)
+    {
+        if (abs(data.calTable[i].raw - raw) <= kCalSnapCounts)
+        {
+            data.calTable[i].raw  = raw;
+            data.calTable[i].torr = torr;
+            sortCalTable();
+            return true;
+        }
+    }
+    if (data.calCount >= CAL_MAX_POINTS) return false;
+    data.calTable[data.calCount].raw  = raw;
+    data.calTable[data.calCount].torr = torr;
+    data.calCount++;
+    sortCalTable();
+    return true;
+}
+
+static float pwlPressure(int raw)
+{
+    if (data.calCount <= 0) return 0.0f;
+    if (data.calCount == 1) return data.calTable[0].torr;
+
+    int i = 1;
+    while (i < data.calCount - 1 && raw >= data.calTable[i].raw) i++;
+
+    float r0 = (float)data.calTable[i - 1].raw,  r1 = (float)data.calTable[i].raw;
+    float p0 = data.calTable[i - 1].torr,         p1 = data.calTable[i].torr;
+    if (r1 == r0) return p0;
+    return p0 + (p1 - p0) * ((float)(raw - r0) / (r1 - r0));
+}
+
+// ---------------------------------------------------------------------------
+// Sensor reading
+// ---------------------------------------------------------------------------
+
+static bool readSensorWord(int &word, int &temp)
+{
+    Wire.requestFrom(data.TWIadd, kSensorBytes);
+    delay(10);
+    word = 0; temp = 0;
+    int i = 0;
+    while (Wire.available() > 0)
+    {
+        uint8_t c = Wire.read();
+        if (i == 1) word |= c << 8;
+        if (i == 2) word |= c;
+        if (i == 4) temp |= c << 8;
+        if (i == 5) temp |= c;
+        i++;
+    }
+    return i == kSensorBytes;
+}
+
+static int sampleRawAveraged(int samples)
+{
+    if (samples < 1) samples = 1;
+    long sum = 0;
+    int  raw, tmp;
+    xSemaphoreTake(wireMutex, portMAX_DELAY);
+    for (int i = 0; i < samples; i++)
+    {
+        Wire.beginTransmission(data.TWIadd);
+        Wire.write(0xD0);
+        Wire.endTransmission(true);
+        readSensorWord(raw, tmp);
+        sum += raw;
+        delay(10);
+    }
+    xSemaphoreGive(wireMutex);
+    return (int)(sum / samples);
+}
+
+static void sensorTask(void *param)
+{
+    for (;;)
+    {
+        int press = 0, rawP = 0, rawT = 0, scratch = 0;
+
+        xSemaphoreTake(wireMutex, portMAX_DELAY);
+
+        Wire.beginTransmission(data.TWIadd);
+        Wire.endTransmission(true);
+        readSensorWord(press, scratch);
+
+        Wire.beginTransmission(data.TWIadd);
+        Wire.write(0xD0);
+        Wire.endTransmission(true);
+        readSensorWord(rawP, rawT);
+
+        xSemaphoreGive(wireMutex);
+
+        // Compute pressure using local copies of cal params (no mutex needed for
+        // calTable/offsets — only written from the main task at infrequent intervals)
+        float fval;
+        if (data.useCalTable)
+        {
+            fval = pwlPressure(rawP);
+        }
+        else
+        {
+            fval = (float)press;
+            if (fval > kTrendKnee)
+                fval = kTrendKnee + (fval - kTrendKnee) * kMicronsPerCount;
+            fval /= 1000.0f;
+        }
+
+        if (fval > kTorrThreshold) fval += (float)data.offsetTorr;
+        else                       fval += (float)data.offsetmTorr / 1000.0f;
+
+        if (fval < kMinPressure) fval = kMinPressure;
+
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        data.rawData  = rawP;
+        data.rawTemp  = rawT;
+        data.calPress = (double)fval;
+        xSemaphoreGive(dataMutex);
+
+        vTaskDelay(pdMS_TO_TICKS(kReadIntervalMs));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+static void centerText(const char *str, int16_t y, uint8_t sz)
+{
+    canvas->setTextSize(sz);
+    int16_t  x1, y1;
+    uint16_t w, h;
+    canvas->getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+    canvas->setCursor((kScreenW - (int16_t)w) / 2 - x1, y);
+    canvas->print(str);
+}
+
+static void updateDisplay()
+{
+    canvas->fillScreen(C_BLACK);
+    canvas->setTextWrap(false);
+
+    switch (appState)
+    {
+    case STATE_PORTAL:
+        canvas->setTextColor(C_YELLOW);
+        centerText("VacuumGauge", kScreenH / 2 - 80, 3);
+        centerText("Setup", kScreenH / 2 - 40, 3);
+        canvas->setTextColor(C_WHITE);
+        centerText("Connect to WiFi:", kScreenH / 2 + 10, 2);
+        canvas->setTextColor(C_CYAN);
+        centerText(kApSSID, kScreenH / 2 + 40, 2);
+        canvas->setTextColor(C_WHITE);
+        centerText("then browse to", kScreenH / 2 + 72, 1);
+        centerText("192.168.4.1", kScreenH / 2 + 90, 2);
+        break;
+
+    case STATE_CONNECTING:
+        canvas->setTextColor(C_YELLOW);
+        centerText("Connecting...", kScreenH / 2 - 30, 3);
+        canvas->setTextColor(C_WHITE);
+        centerText(data.ssid, kScreenH / 2 + 20, 2);
+        break;
+
+    case STATE_RUNNING:
+    {
+        // Device name — top left
+        canvas->setTextColor(C_GREEN);
+        canvas->setTextSize(2);
+        canvas->setCursor(4, 4);
+        canvas->print(data.Name);
+
+        // Snapshot live readings
+        float p;
+        int   raw;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        p   = (float)data.calPress;
+        raw = data.rawData;
+        xSemaphoreGive(dataMutex);
+
+        // Pressure number and unit
+        char        pStr[16];
+        const char *unit;
+        if (p < 1.0f)
+        {
+            snprintf(pStr, sizeof(pStr), "%.0f", p * 1000.0f);
+            unit = "mTorr";
+        }
+        else if (p < 100.0f)
+        {
+            snprintf(pStr, sizeof(pStr), "%.1f", p);
+            unit = "Torr";
+        }
+        else
+        {
+            snprintf(pStr, sizeof(pStr), "%.0f", p);
+            unit = "Torr";
+        }
+
+        canvas->setTextColor(C_WHITE);
+        centerText(pStr, kScreenH / 2 - 56, 6);   // 48px tall at size 6
+
+        canvas->setTextColor(C_CYAN);
+        centerText(unit, kScreenH / 2 + 16, 4);    // 32px tall at size 4
+
+        // IP + cal mode — bottom
+        canvas->setTextColor(C_LGRAY);
+        canvas->setTextSize(2);
+
+        String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "---";
+        String ipLine = "IP: " + ip;
+        String calLine = String("Cal: ") + (data.useCalTable ? "Table" : "Factory");
+
+        canvas->setCursor(4, kScreenH - 40);
+        canvas->print(ipLine);
+        canvas->setCursor(4, kScreenH - 20);
+        canvas->print(calLine);
+        break;
+    }
+    }
+
+    canvas->flush();
+}
+
+// ---------------------------------------------------------------------------
+// WiFi helpers
+// ---------------------------------------------------------------------------
+
+static void startAP()
+{
+    dnsServer.stop();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(kApIP, kApIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP(kApSSID);
+    dnsServer.start(53, "*", kApIP);
+    appState = STATE_PORTAL;
+}
+
+static void startSTA()
+{
+    dnsServer.stop();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(data.ssid, data.pass);
+    connectStartMs = millis();
+    appState = STATE_CONNECTING;
+}
+
+// ---------------------------------------------------------------------------
+// Captive portal HTML
+// ---------------------------------------------------------------------------
+
+static const char kSetupHtml[] = R"rawhtml(<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VacuumGauge Setup</title>
+<style>
+body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:20px;background:#111;color:#eee}
+h1{color:#4af;margin-bottom:24px}
+label{display:block;font-size:13px;color:#aaa;margin-top:14px}
+input{width:100%;padding:12px;margin-top:4px;box-sizing:border-box;border-radius:6px;
+      border:1px solid #444;background:#222;color:#eee;font-size:16px}
+button{display:block;width:100%;padding:14px;margin-top:24px;background:#4af;color:#000;
+       border:none;border-radius:6px;font-size:18px;font-weight:bold;cursor:pointer}
+button:hover{background:#6cf}
+#msg{text-align:center;margin-top:16px;min-height:20px;color:#4f4}
+</style>
+</head>
+<body>
+<h1>VacuumGauge Setup</h1>
+<label>WiFi Network (SSID)</label>
+<input id="ssid" type="text" placeholder="Enter WiFi name" autocomplete="off" autocorrect="off" spellcheck="false">
+<label>WiFi Password</label>
+<input id="pass" type="password" placeholder="Enter WiFi password">
+<label>Device Name</label>
+<input id="name" type="text" placeholder="Press" value="Press" maxlength="19">
+<button onclick="save()">Save &amp; Connect</button>
+<p id="msg"></p>
+<script>
+function save(){
+  var s=document.getElementById('ssid').value.trim();
+  if(!s){document.getElementById('msg').innerText='SSID is required';return;}
+  var d={ssid:s,pass:document.getElementById('pass').value,
+         name:document.getElementById('name').value.trim()||'Press'};
+  document.getElementById('msg').innerText='Saving...';
+  fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)})
+  .then(function(r){return r.text();})
+  .then(function(t){document.getElementById('msg').innerText='Saved! Device restarting...';})
+  .catch(function(e){document.getElementById('msg').innerText='Error: '+e;});
+}
+</script>
+</body>
+</html>)rawhtml";
+
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
+
+static void setupServer()
+{
+    // Serve setup page (AP mode)
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        request->send(200, "text/html", kSetupHtml);
+    });
+
+    // Receive credentials via POST /save
+    server.on("/save", HTTP_POST,
+        // Response handler — runs after body handler has finished
+        [](AsyncWebServerRequest *request)
+        {
+            Preferences p;
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, s_saveBody, s_saveBodyLen);
+            if (err || !p.begin("vacgauge", false))
+            {
+                request->send(400, "text/plain", "Bad request");
+                return;
+            }
+            p.putString("ssid", doc["ssid"] | "");
+            p.putString("pass", doc["pass"] | "");
+            const char *nm = doc["name"] | "Press";
+            p.putString("name", (nm && strlen(nm) > 0) ? nm : "Press");
+            // Preserve existing cal/offset settings
+            p.putInt("toff",    data.offsetTorr);
+            p.putInt("mtoff",   data.offsetmTorr);
+            p.putInt("calmode", data.useCalTable);
+            p.putInt("calcnt",  data.calCount);
+            p.end();
+            request->send(200, "text/plain", "Saved. Restarting...");
+            restartPending = true;
+        },
+        nullptr,  // no file upload
+        // Body accumulator
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len,
+           size_t index, size_t total)
+        {
+            if (index == 0) s_saveBodyLen = 0;
+            size_t space = sizeof(s_saveBody) - s_saveBodyLen - 1;
+            size_t copy  = (len < space) ? len : space;
+            memcpy(s_saveBody + s_saveBodyLen, data, copy);
+            s_saveBodyLen += copy;
+            s_saveBody[s_saveBodyLen] = '\0';
+        }
+    );
+
+    // REST: GET /pressure
+    server.on("/pressure", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        float p;
+        int   raw;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        p   = (float)data.calPress;
+        raw = data.rawData;
+        xSemaphoreGive(dataMutex);
+
+        float       displayVal;
+        const char *displayUnit;
+        if (p < 1.0f) { displayVal = p * 1000.0f; displayUnit = "mTorr"; }
+        else          { displayVal = p;             displayUnit = "Torr";  }
+
+        JsonDocument doc;
+        doc["device"]        = data.Name;
+        doc["pressure"]      = p;
+        doc["unit"]          = "Torr";
+        doc["display_value"] = displayVal;
+        doc["display_unit"]  = displayUnit;
+        doc["raw"]           = (uint32_t)raw;
+        doc["cal_mode"]      = data.useCalTable;
+        doc["timestamp"]     = (uint32_t)(millis() / 1000);
+
+        String body;
+        serializeJson(doc, body);
+        AsyncWebServerResponse *r = request->beginResponse(200, "application/json", body);
+        r->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(r);
+    });
+
+    // REST: GET /status
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        JsonDocument doc;
+        doc["device"]     = data.Name;
+        doc["ip"]         = WiFi.localIP().toString();
+        doc["rssi"]       = WiFi.RSSI();
+        doc["cal_mode"]   = data.useCalTable;
+        doc["cal_points"] = data.calCount;
+
+        String body;
+        serializeJson(doc, body);
+        AsyncWebServerResponse *r = request->beginResponse(200, "application/json", body);
+        r->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(r);
+    });
+
+    // Captive portal redirect for all unknown paths
+    server.onNotFound([](AsyncWebServerRequest *request)
+    {
+        if (appState == STATE_PORTAL)
+            request->redirect("http://192.168.4.1/");
+        else
+            request->send(404, "text/plain", "Not found");
+    });
+
+    server.begin();
+}
 
 // ---------------------------------------------------------------------------
 // Serial command handlers
 // ---------------------------------------------------------------------------
 
-void saveSettings(void)
+void saveSettings()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  if(saveData()) cp.sendACK();
-  else           cp.sendNAK();
+    if (!cp.checkExpectedArgs(0)) return;
+    if (saveData()) { lastSaved = data; cp.sendACK(); }
+    else              cp.sendNAK();
 }
 
-void loadSettings(void)
+void loadSettings()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  if(loadData()) cp.sendACK();
-  else           cp.sendNAK();
+    if (!cp.checkExpectedArgs(0)) return;
+    if (loadData()) { lastSaved = data; cp.sendACK(); }
+    else              cp.sendNAK();
 }
 
-// ---- WiFi commands --------------------------------------------------------
-
-// SSID         -> report the configured WiFi SSID
-// SSID,<text>  -> set it. Bounded copy (the CMDstr path uses an unbounded strcpy,
-//                 so credentials are handled here instead).
-void wifiSsid(void)
+void wifiSsid()
 {
-  if(cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.ssid); return; }
-  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
-  char *v;
-  if(!cp.getValue(&v)) { cp.sendNAK(); return; }
-  strncpy(data.ssid, v, sizeof(data.ssid) - 1);
-  data.ssid[sizeof(data.ssid) - 1] = '\0';
-  cp.sendACK();
+    if (cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.ssid); return; }
+    if (cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+    char *v;
+    if (!cp.getValue(&v)) { cp.sendNAK(); return; }
+    strncpy(data.ssid, v, sizeof(data.ssid) - 1);
+    data.ssid[sizeof(data.ssid) - 1] = '\0';
+    cp.sendACK();
 }
 
-// PASS / PASS,<text> - report / set the WiFi password (bounded copy).
-void wifiPass(void)
+void wifiPass()
 {
-  if(cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.pass); return; }
-  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
-  char *v;
-  if(!cp.getValue(&v)) { cp.sendNAK(); return; }
-  strncpy(data.pass, v, sizeof(data.pass) - 1);
-  data.pass[sizeof(data.pass) - 1] = '\0';
-  cp.sendACK();
+    if (cp.getNumArgs() == 0) { cp.sendACK(false); cp.println(data.pass); return; }
+    if (cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+    char *v;
+    if (!cp.getValue(&v)) { cp.sendNAK(); return; }
+    strncpy(data.pass, v, sizeof(data.pass) - 1);
+    data.pass[sizeof(data.pass) - 1] = '\0';
+    cp.sendACK();
 }
 
-// WIFICONN - apply the stored credentials/port: (re)connect and (re)open the
-// TCP server. Settings are persisted first so they survive a reboot.
-void wifiConn(void)
+void wifiConn()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  saveData();
-  lastSaved = data;
-  startWiFi();
-  cp.sendACK();
+    if (!cp.checkExpectedArgs(0)) return;
+    saveData();
+    lastSaved = data;
+    startSTA();
+    cp.sendACK();
 }
 
-// WIFI - report the wireless link status (SSID, connection state, IP, port).
-void wifiStatus(void)
+void wifiStatus()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  cp.sendACK(false);
-  cp.print("SSID: ");      cp.println(data.ssid);
-  cp.print("Connected: "); cp.println(WiFi.status() == WL_CONNECTED);
-  cp.print("IP: ");        cp.println(WiFi.localIP().toString().c_str());
-  cp.print("Port: ");      cp.println(data.tcpPort);
+    if (!cp.checkExpectedArgs(0)) return;
+    cp.sendACK(false);
+    cp.print("SSID: ");
+    cp.println(data.ssid);
+    cp.print("State: ");
+    if (appState == STATE_RUNNING)    cp.println("Connected");
+    else if (appState == STATE_CONNECTING) cp.println("Connecting");
+    else                              cp.println("Portal");
+    cp.print("IP: ");
+    cp.println(WiFi.localIP().toString().c_str());
 }
 
-// ---- Calibration commands -------------------------------------------------
-
-// CALPRES,<torr> - capture the current operating point: average the raw counts
-// and pair them with the user-supplied true pressure, adding or updating a table
-// point. Use CALMODE,1 to see the effect on the reading; the point is captured
-// regardless of the active mode.
-void calAddPoint(void)
+void calAddPoint()
 {
-  float torr;
-  if(cp.getNumArgs() != 1) { cp.sendNAK(); return; }
-  if(!cp.getValue(&torr))  { cp.sendNAK(); return; }
+    float torr;
+    if (cp.getNumArgs() != 1) { cp.sendNAK(); return; }
+    if (!cp.getValue(&torr))  { cp.sendNAK(); return; }
 
-  int raw = sampleRawAveraged(kCalAvgSamples);
-  if(!addCalPoint(raw, torr)) { cp.sendNAK(); return; }   // table full
+    int raw = sampleRawAveraged(kCalAvgSamples);
+    if (!addCalPoint(raw, torr)) { cp.sendNAK(); return; }
 
-  saveData();
-  lastSaved = data;
-
-  cp.sendACK(false);
-  cp.print("Cal point raw=");
-  cp.print(raw);
-  cp.print(" torr=");
-  cp.println(torr);
+    saveData();
+    lastSaved = data;
+    cp.sendACK(false);
+    cp.print("Cal point raw=");
+    cp.print(raw);
+    cp.print(" torr=");
+    cp.println(torr);
 }
 
-// CALCLEAR - empty the table so a fresh one can be built point by point.
-void calClear(void)
+void calClear()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  data.calCount = 0;
-  saveData();
-  lastSaved = data;
-  cp.sendACK();
+    if (!cp.checkExpectedArgs(0)) return;
+    data.calCount = 0;
+    saveData();
+    lastSaved = data;
+    cp.sendACK();
 }
 
-// CALDEF - restore the factory default calibration table.
-void calDefaults(void)
+void calDefaults()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  loadDefaultCalTable();
-  saveData();
-  lastSaved = data;
-  cp.sendACK();
+    if (!cp.checkExpectedArgs(0)) return;
+    loadDefaultCalTable();
+    saveData();
+    lastSaved = data;
+    cp.sendACK();
 }
 
-// GRAW - take a fresh averaged raw reading and report it. Same value CALPRES
-// would capture, so it can be previewed before committing a calibration point.
-void getRaw(void)
+void getRaw()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  cp.println(sampleRawAveraged(kCalAvgSamples));
+    if (!cp.checkExpectedArgs(0)) return;
+    cp.println(sampleRawAveraged(kCalAvgSamples));
 }
 
-// CALDUMP - list the calibration table (raw count, pressure in Torr).
-void calDump(void)
+void calDump()
 {
-  if(!cp.checkExpectedArgs(0)) return;
-  cp.sendACK(false);
-  cp.print("Cal table, ");
-  cp.print(data.calCount);
-  cp.println(" points:");
-  for(int i = 0; i < data.calCount; i++)
-  {
-    cp.print("  ");
-    cp.print(data.calTable[i].raw);
-    cp.print("  ");
-    cp.println(data.calTable[i].torr);
-  }
+    if (!cp.checkExpectedArgs(0)) return;
+    cp.sendACK(false);
+    cp.print("Cal table, ");
+    cp.print(data.calCount);
+    cp.println(" points:");
+    for (int i = 0; i < data.calCount; i++)
+    {
+        cp.print("  ");
+        cp.print(data.calTable[i].raw);
+        cp.print("  ");
+        cp.println(data.calTable[i].torr);
+    }
+}
+
+void Debug()
+{
+    cp.print("Raw data: ");
+    cp.println(data.rawData);
 }
 
 // ---------------------------------------------------------------------------
 // Command table
-//
-// Columns: name, type, expected-arg-count, target pointer, constraint, help.
-// A -1 arg-count disables the argument-count check (used for get/set queries).
 // ---------------------------------------------------------------------------
 
 Command cmds[] =
 {
-  {"GVER",     CMDstr,      0,  (void *)Version,             NULL, "Firmware version"},
-  {"?NAME",    CMDstr,     -1,  (void *)&data.Name,          NULL, "Device name"},
-  {"LOAD",     CMDfunction, 0,  (void *)loadSettings,        NULL, "Load the saved parameters"},
-  {"SAVE",     CMDfunction, 0,  (void *)saveSettings,        NULL, "Save parameters to file"},
-  {"GPRES",    CMDdouble,   0,  (void *)&data.calPress,      NULL, "Return pressure in Torr"},
-  {"GRPRES",   CMDint,      0,  (void *)&data.rawData,       NULL, "Return last raw pressure sensor data"},
-  {"GRAW",     CMDfunction, 0,  (void *)getRaw,              NULL, "Return a fresh averaged raw sensor reading"},
-  {"GRTEMP",   CMDint,      0,  (void *)&data.rawTemp,       NULL, "Return raw temp sensor data"},
-  {"?TOFFSET", CMDint,     -1,  (void *)&data.offsetTorr,    NULL, "Set/return Torr offset"},
-  {"?MTOFFSET",CMDint,     -1,  (void *)&data.offsetmTorr,   NULL, "Set/return milli-Torr offset"},
-  {"?CALMODE", CMDint,     -1,  (void *)&data.useCalTable,   NULL, "Calibration mode: 0=factory formula, 1=PWL table"},
-  {"CALPRES",  CMDfunction, 1,  (void *)calAddPoint,         NULL, "CALPRES,<torr>: capture cal point at current raw"},
-  {"CALCLEAR", CMDfunction, 0,  (void *)calClear,            NULL, "Clear the calibration table"},
-  {"CALDEF",   CMDfunction, 0,  (void *)calDefaults,         NULL, "Restore factory default cal table"},
-  {"CALDUMP",  CMDfunction, 0,  (void *)calDump,             NULL, "List the calibration table"},
-  {"SSID",     CMDfunction, -1, (void *)wifiSsid,            NULL, "Get/set WiFi SSID (SSID or SSID,<text>)"},
-  {"PASS",     CMDfunction, -1, (void *)wifiPass,            NULL, "Get/set WiFi password (PASS or PASS,<text>)"},
-  {"?WPORT",   CMDint,      -1, (void *)&data.tcpPort,       NULL, "Get/set TCP port for the wireless link"},
-  {"WIFICONN", CMDfunction, 0,  (void *)wifiConn,            NULL, "Save WiFi settings and (re)connect"},
-  {"WIFI",     CMDfunction, 0,  (void *)wifiStatus,          NULL, "Report WiFi status (SSID, IP, port)"},
-  {NULL}
+    {"GVER",     CMDstr,       0, (void *)Version,            NULL, "Firmware version"},
+    {"?NAME",    CMDstr,      -1, (void *)&data.Name,         NULL, "Device name"},
+    {"LOAD",     CMDfunction,  0, (void *)loadSettings,       NULL, "Load saved parameters from NVS"},
+    {"SAVE",     CMDfunction,  0, (void *)saveSettings,       NULL, "Save parameters to NVS"},
+    {"GPRES",    CMDdouble,    0, (void *)&data.calPress,     NULL, "Return pressure in Torr"},
+    {"GRPRES",   CMDint,       0, (void *)&data.rawData,      NULL, "Return last raw pressure count"},
+    {"GRAW",     CMDfunction,  0, (void *)getRaw,             NULL, "Return a fresh averaged raw reading"},
+    {"GRTEMP",   CMDint,       0, (void *)&data.rawTemp,      NULL, "Return raw temperature count"},
+    {"?TOFFSET", CMDint,      -1, (void *)&data.offsetTorr,   NULL, "Set/return Torr offset"},
+    {"?MTOFFSET",CMDint,      -1, (void *)&data.offsetmTorr,  NULL, "Set/return milli-Torr offset"},
+    {"?CALMODE", CMDint,      -1, (void *)&data.useCalTable,  NULL, "Calibration mode: 0=factory formula, 1=PWL table"},
+    {"CALPRES",  CMDfunction,  1, (void *)calAddPoint,        NULL, "CALPRES,<torr>: capture cal point at current raw"},
+    {"CALCLEAR", CMDfunction,  0, (void *)calClear,           NULL, "Clear the calibration table"},
+    {"CALDEF",   CMDfunction,  0, (void *)calDefaults,        NULL, "Restore factory default cal table"},
+    {"CALDUMP",  CMDfunction,  0, (void *)calDump,            NULL, "List the calibration table"},
+    {"SSID",     CMDfunction, -1, (void *)wifiSsid,           NULL, "Get/set WiFi SSID"},
+    {"PASS",     CMDfunction, -1, (void *)wifiPass,           NULL, "Get/set WiFi password"},
+    {"WIFICONN", CMDfunction,  0, (void *)wifiConn,           NULL, "Save WiFi settings and connect in STA mode"},
+    {"WIFI",     CMDfunction,  0, (void *)wifiStatus,         NULL, "Report WiFi status"},
+    {NULL}
 };
 static CommandList cmdList = {cmds, NULL};
 
@@ -378,322 +859,16 @@ static CommandList cmdList = {cmds, NULL};
 // Change detection
 // ---------------------------------------------------------------------------
 
-// Returns true when any user-persistent setting differs from the copy that was
-// last written to flash. The live measurement fields (calPress, rawData,
-// rawTemp) change on every read, so they are deliberately excluded - only the
-// configuration we actually want to persist is compared. (The previous version
-// compared the raw struct bytes, which also compared indeterminate padding and
-// could trigger spurious saves.)
-static bool settingsChanged(void)
+static bool settingsChanged()
 {
-  return data.offsetTorr  != lastSaved.offsetTorr  ||
-         data.offsetmTorr != lastSaved.offsetmTorr ||
-         data.useCalTable != lastSaved.useCalTable ||
-         data.tcpPort     != lastSaved.tcpPort     ||
-         data.TWIadd      != lastSaved.TWIadd      ||
-         data.Rev         != lastSaved.Rev         ||
-         strncmp(data.Name, lastSaved.Name, sizeof(data.Name)) != 0 ||
-         strncmp(data.ssid, lastSaved.ssid, sizeof(data.ssid)) != 0 ||
-         strncmp(data.pass, lastSaved.pass, sizeof(data.pass)) != 0;
-}
-
-// Debug command: report the latest raw pressure count.
-//
-// NOTE: cp.println() has no String overload - passing an Arduino String (e.g.
-// "Raw data: " + String(data.rawData)) silently converts to bool and prints
-// "TRUE". Use the typed print()/println() overloads instead.
-void Debug(void)
-{
-  cp.print("Raw data: ");
-  cp.println(data.rawData);   // println(int)
-//  cp.println(settingsChanged() ? "Changed since last save" : "No change");
-}
-
-// ---------------------------------------------------------------------------
-// Persistence (SPIFFS)
-// ---------------------------------------------------------------------------
-
-bool saveData(void)
-{
-  if(!spiffsReady) return false;
-
-  File file = SPIFFS.open(kSettingsFile, FILE_WRITE);
-  if(!file) return false;
-
-  size_t written = file.write((uint8_t *)&data, sizeof(Data));
-  file.close();
-  return written == sizeof(Data);
-}
-
-bool loadData(void)
-{
-  if(!spiffsReady) return false;
-
-  File file = SPIFFS.open(kSettingsFile, FILE_READ);
-  if(!file) return false;
-
-  Data d;
-  size_t read = file.read((uint8_t *)&d, sizeof(Data));
-  file.close();
-
-  // Only accept the file if it is the expected size/layout.
-  if(read == sizeof(Data) && d.Size == data.Size)
-  {
-    data = d;
-    return true;
-  }
-  return false;
-}
-
-// ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-void displayPressure(float pressure)
-{
-  String pStr;
-
-  tft.drawString("Vacuum pressure", 0, 0, 1);
-  tft.drawString("GAACE, 2024", 0, 110, 1);
-
-  // Clear the dynamic value/units region so shrinking numbers or a units
-  // change (Torr <-> mTorr) cannot leave ghost characters behind.
-  tft.fillRect(0, 30, screenWidth, 66, TFT_BLACK);
-
-  if(pressure > 100.0f)
-  {
-    // Coarse vacuum: whole Torr.
-    pStr = String(pressure, 0);
-    tft.drawString(pStr.c_str(), 1, 35, 4);
-    tft.drawString("Torr", 45, 70, 4);
-  }
-  else if(pressure >= 1.0f)
-  {
-    // Medium vacuum: one decimal of Torr.
-    pStr = String(pressure, 1);
-    tft.drawString(pStr.c_str(), 1, 35, 4);
-    tft.drawString("Torr", 45, 70, 4);
-  }
-  else
-  {
-    // Fine vacuum: show in mTorr.
-    pStr = String(pressure * 1000.0f, 0);
-    tft.drawString(pStr.c_str(), 1, 35, 4);
-    tft.drawString("mTorr", 45, 70, 4);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Piece-wise linear (PWL) calibration table
-//
-// Maps the raw sensor reading (data.rawData) to pressure in Torr by linear
-// interpolation between calibration points held in data.calTable. This is an
-// OPTIONAL alternative to the factory micron formula, selected by
-// data.useCalTable (see the ?CALMODE command).
-//
-// The active table lives in Data, so it persists to flash and is field-editable
-// via the CALPRES / CALCLEAR / CALDEF / CALDUMP commands. Points are kept sorted
-// by ASCENDING raw value; pressure normally DECREASES as the raw count rises.
-// defaultCalTable is the factory table, copied into the active table on first
-// boot (or via CALDEF).
-// ---------------------------------------------------------------------------
-
-static const CalPoint defaultCalTable[] =
-{
-  {18836, 760.00f},
-  {21012, 28.90f},
-  {21916, 18.70f},
-  {24386,  8.57f},
-  {25868,  5.94f},
-  {27390,  4.14f},
-  {28354,  3.39f},
-  {29279,  2.77f},
-  {30015,  2.38f},
-  {30556,  2.08f},
-  {30777,  1.97f},
-  {31484,  1.70f},
-};
-static const int defaultCalCount = sizeof(defaultCalTable) / sizeof(defaultCalTable[0]);
-
-// Copy the factory default table into the active (persisted) table.
-static void loadDefaultCalTable(void)
-{
-  data.calCount = defaultCalCount;
-  for(int i = 0; i < defaultCalCount; i++) data.calTable[i] = defaultCalTable[i];
-}
-
-// Sort the active table in place by ascending raw value (insertion sort - the
-// table is small, so this is more than fast enough).
-static void sortCalTable(void)
-{
-  for(int i = 1; i < data.calCount; i++)
-  {
-    CalPoint key = data.calTable[i];
-    int j = i - 1;
-    while(j >= 0 && data.calTable[j].raw > key.raw)
-    {
-      data.calTable[j + 1] = data.calTable[j];
-      j--;
-    }
-    data.calTable[j + 1] = key;
-  }
-}
-
-// Add or update a calibration point. If an existing point's raw is within
-// kCalSnapCounts of `raw`, that point is replaced (both raw and torr updated);
-// otherwise a new point is appended. The table is then re-sorted by raw.
-// Returns false only when the table is full and no nearby point exists.
-// Monotonicity is NOT enforced - the caller is trusted.
-static bool addCalPoint(int raw, float torr)
-{
-  for(int i = 0; i < data.calCount; i++)
-  {
-    if(abs(data.calTable[i].raw - raw) <= kCalSnapCounts)
-    {
-      data.calTable[i].raw  = raw;
-      data.calTable[i].torr = torr;
-      sortCalTable();
-      return true;
-    }
-  }
-  if(data.calCount >= CAL_MAX_POINTS) return false;
-  data.calTable[data.calCount].raw  = raw;
-  data.calTable[data.calCount].torr = torr;
-  data.calCount++;
-  sortCalTable();
-  return true;
-}
-
-// Interpolate pressure (Torr) from a raw sensor count using the active table.
-// Readings outside the calibrated range are EXTRAPOLATED along the slope of the
-// nearest end segment rather than clamped, so the gauge stays responsive just
-// beyond the table. (Extrapolation is a straight-line guess; error grows with
-// distance - add points to extend the trustworthy range. A negative result is
-// floored later by the kMinPressure clamp.) With fewer than two points there is
-// nothing to interpolate.
-static float pwlPressure(int raw)
-{
-  if(data.calCount <= 0) return 0.0f;
-  if(data.calCount == 1) return data.calTable[0].torr;
-
-  // Find the segment [i-1, i] to use. Interior readings land in their bracketing
-  // segment; readings below the first / above the last point reuse the first /
-  // last segment and extrapolate.
-  int i = 1;
-  while(i < data.calCount - 1 && raw >= data.calTable[i].raw) i++;
-
-  float r0 = data.calTable[i - 1].raw,  r1 = data.calTable[i].raw;
-  float p0 = data.calTable[i - 1].torr, p1 = data.calTable[i].torr;
-  if(r1 == r0) return p0;   // coincident raws (possible: monotonicity not enforced)
-  return p0 + (p1 - p0) * ((float)(raw - r0) / (r1 - r0));
-}
-
-// ---------------------------------------------------------------------------
-// Sensor reading (periodic task)
-// ---------------------------------------------------------------------------
-
-// Reads kSensorBytes from the sensor and returns the 16-bit value packed in
-// bytes [1] (high) and [2] (low). Returns true if the expected number of bytes
-// was received.
-static bool readSensorWord(int &word, int &temp)
-{
-  Wire.requestFrom(data.TWIadd, kSensorBytes);
-  delay(10);
-
-  word = 0;
-  temp = 0;
-  int i = 0;
-  while(Wire.available() > 0)
-  {
-    uint8_t c = Wire.read();
-    if(i == 1) word |= c << 8;
-    if(i == 2) word |= c;
-    if(i == 4) temp |= c << 8;
-    if(i == 5) temp |= c;
-    i++;
-  }
-  return i == kSensorBytes;
-}
-
-// Average several raw pressure reads (register 0xD0) for a stable calibration
-// sample. Blocks for roughly samples * 10 ms; only called from the CALPRES
-// command handler, never from the periodic task.
-static int sampleRawAveraged(int samples)
-{
-  if(samples < 1) samples = 1;
-  long sum = 0;
-  int  raw, temp;
-  for(int i = 0; i < samples; i++)
-  {
-    Wire.beginTransmission(data.TWIadd);
-    Wire.write(0xD0);
-    Wire.endTransmission(true);
-    readSensorWord(raw, temp);
-    sum += raw;
-    delay(10);
-  }
-  return (int)(sum / samples);
-}
-
-bool readPressure(void *)
-{
-  // Read the factory-calibrated pressure (default register, no command byte).
-  Wire.beginTransmission(data.TWIadd);
-  Wire.endTransmission(true);
-  int press = 0, scratchTemp = 0;
-  readSensorWord(press, scratchTemp);
-
-  // Read the raw pressure/temperature counts (register 0xD0).
-  Wire.beginTransmission(data.TWIadd);
-  Wire.write(0xD0);
-  Wire.endTransmission(true);
-  readSensorWord(data.rawData, data.rawTemp);
-
-  // Convert sensor counts to Torr, using either the optional PWL calibration
-  // table or the factory formula.
-  float fval;
-  if(data.useCalTable)
-  {
-    // Optional calibration: interpolate pressure from the raw count.
-    fval = pwlPressure(data.rawData);
-  }
-  else
-  {
-    // Factory conversion:
-    //   0..50000      : counts are microns directly.
-    //   50000..65535  : trend-only region, ~45.7 microns per count above the knee.
-    fval = press;
-    if(fval > kTrendKnee)
-      fval = kTrendKnee + (fval - kTrendKnee) * kMicronsPerCount;
-    fval = fval / 1000.0f;   // microns -> Torr (1 Torr = 1000 microns)
-  }
-
-  // Apply the appropriate user zero offset.
-  if(fval > kTorrThreshold) fval += data.offsetTorr;
-  else                      fval += (float)data.offsetmTorr / 1000.0f;
-
-  // Absolute pressure can never be negative. A large negative zero-offset (or
-  // sensor noise near full vacuum) can drive the computed value below zero, so
-  // clamp to the physical floor before reporting/displaying it.
-  if(fval < kMinPressure) fval = kMinPressure;
-
-  data.calPress = (double)fval;
-  displayPressure(fval);
-  return true;   // keep the timer scheduled
-}
-
-// ---------------------------------------------------------------------------
-// Persist-on-change (periodic task)
-// ---------------------------------------------------------------------------
-
-bool saveChanges(void *)
-{
-  if(settingsChanged())
-  {
-    lastSaved = data;
-    saveData();
-  }
-  return true;   // keep the timer scheduled
+    return data.offsetTorr  != lastSaved.offsetTorr  ||
+           data.offsetmTorr != lastSaved.offsetmTorr ||
+           data.useCalTable != lastSaved.useCalTable  ||
+           data.TWIadd      != lastSaved.TWIadd       ||
+           data.Rev         != lastSaved.Rev          ||
+           strncmp(data.Name, lastSaved.Name, sizeof(data.Name)) != 0 ||
+           strncmp(data.ssid, lastSaved.ssid, sizeof(data.ssid)) != 0 ||
+           strncmp(data.pass, lastSaved.pass, sizeof(data.pass)) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -702,78 +877,107 @@ bool saveChanges(void *)
 
 void setup()
 {
-  delay(100);
+    delay(100);
+    Serial.begin(115200);
+    Serial.setDebugOutput(true);
 
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("GAACE", 0, 0, 1);
-  tft.setTextFont(4);
+    dataMutex = xSemaphoreCreateMutex();
+    wireMutex = xSemaphoreCreateMutex();
 
-  data.offsetTorr  = 0;
-  data.offsetmTorr = 0;
+    Wire.begin(kI2C_SDA, kI2C_SCL, kI2C_Hz);
+    pinMode(kBootPin, INPUT_PULLUP);
 
-  // 115200 is conventional; on the ESP32-S3 USB-CDC port the baud rate is
-  // ignored, but this keeps the firmware correct if Serial maps to a UART.
-  Serial.begin(115200);
-  Serial.setDebugOutput(true);
+    if (!canvas->begin())
+        Serial.println("Display init failed — check QSPI wiring");
+    canvas->fillScreen(C_BLACK);
+    canvas->flush();
 
-  cp.registerStream(&Serial);
-  cp.registerStream(&wifiClient);   // 2nd command stream over the wireless link
-  cp.registerCommands(&cmdList);
-  cp.registerCommands(dbg.debugCommands());
-  dbg.registerDebugFunction(Debug);
+    cp.registerStream(&Serial);
+    cp.registerCommands(&cmdList);
+    cp.registerCommands(dbg.debugCommands());
+    dbg.registerDebugFunction(Debug);
 
-  Wire.begin(kI2C_SDA, kI2C_SCL, kI2C_Hz);
-  buttonA.begin();
-  buttonB.begin();
+    if (!loadData())
+    {
+        loadDefaultCalTable();
+        saveData();
+    }
+    lastSaved = data;
 
-  // Mount the filesystem once, then load (or create) the settings file. On a
-  // fresh device (or after a struct-layout change) loadData() fails, so seed the
-  // factory calibration table before writing the first settings file.
-  spiffsReady = SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED);
-  if(!loadData())
-  {
-    loadDefaultCalTable();
-    saveData();
-  }
-  lastSaved = data;
+    if (strlen(data.ssid) == 0)
+        startAP();
+    else
+        startSTA();
 
-  startWiFi();   // connect with stored credentials (no-op if none configured)
+    setupServer();
 
-  timer.every(kReadIntervalMs, readPressure);
-  timer.every(kSaveIntervalMs, saveChanges);
+    xTaskCreatePinnedToCore(sensorTask, "sensor", 4096, nullptr, 1, nullptr, 1);
 }
 
 void loop()
 {
-  timer.tick();
-  serviceWiFi();          // adopt any new TCP client before reading streams
-  cp.processStreams();
-  cp.processCommands();
+    cp.processStreams();
+    cp.processCommands();
 
-  // Sample both buttons once per loop. The Button library's pressed() only
-  // inspects the snapshot taken by read(); without these calls the debounced
-  // state never updates and pressed() can never return true.
-  buttonA.read();
-  buttonB.read();
+    // DNS captive portal (AP mode only)
+    if (appState == STATE_PORTAL)
+        dnsServer.processNextRequest();
 
-  // Button A nudges the zero offset up; Button B nudges it down. Which trim is
-  // adjusted (coarse Torr vs fine mTorr) follows the current reading range.
-  if(buttonA.pressed())
-  {
-    if(data.calPress > kTorrThreshold) data.offsetTorr++;
-    else                               data.offsetmTorr += 10;
-  }
-  if(buttonB.pressed())
-  {
-    if(data.calPress > kTorrThreshold) data.offsetTorr--;
-    else                               data.offsetmTorr -= 10;
-  }
+    // WiFi connection state machine
+    if (appState == STATE_CONNECTING)
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            appState = STATE_RUNNING;
+            Serial.print("Connected, IP: ");
+            Serial.println(WiFi.localIP());
+        }
+        else if (millis() - connectStartMs > 30000)
+        {
+            Serial.println("WiFi timeout — falling back to portal");
+            startAP();
+        }
+    }
 
-  // Keep both trims within range no matter how they were changed (button press
-  // or ?TOFFSET / ?MTOFFSET serial command).
-  data.offsetTorr  = constrain(data.offsetTorr,  -kMaxOffsetTorr,  kMaxOffsetTorr);
-  data.offsetmTorr = constrain(data.offsetmTorr, -kMaxOffsetmTorr, kMaxOffsetmTorr);
+    // Boot button long-press: clear WiFi credentials and reboot to portal
+    bool bootDown = (digitalRead(kBootPin) == LOW);
+    if (bootDown && !bootWasPressed)
+    {
+        bootWasPressed = true;
+        bootPressStart = millis();
+    }
+    if (!bootDown)
+        bootWasPressed = false;
+    if (bootWasPressed && (millis() - bootPressStart >= kBootLongPressMs))
+    {
+        clearCredentials();
+        delay(200);
+        ESP.restart();
+    }
+
+    // Display refresh
+    unsigned long now = millis();
+    if (now - lastDisplayMs >= 500)
+    {
+        lastDisplayMs = now;
+        updateDisplay();
+    }
+
+    // Persist changed settings
+    if (now - lastSaveMs >= kSaveIntervalMs)
+    {
+        lastSaveMs = now;
+        if (settingsChanged())
+        {
+            lastSaved = data;
+            saveData();
+        }
+    }
+
+    // Deferred restart (triggered by POST /save)
+    if (restartPending)
+    {
+        delay(1500);
+        ESP.restart();
+    }
 }
