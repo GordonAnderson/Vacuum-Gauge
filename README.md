@@ -8,6 +8,7 @@ NVS storage, and REST API are identical on both.
 | Environment | Board | Display |
 |---|---|---|
 | `waveshare_amoled_164` | Waveshare ESP32-S3-Touch-AMOLED-1.64 | 280 × 456 CO5300 AMOLED, landscape |
+| `waveshare_touch_lcd_2` | Waveshare ESP32-S3-Touch-LCD-2 | 240 × 320 ST7789T3 IPS, landscape |
 | `lilygo_t_qt` | LILYGO T-QT Pro S3 | 128 × 128 GC9A01 round TFT |
 
 The gauge reads the sensor every 500 ms, auto-ranges the pressure between Torr
@@ -34,7 +35,7 @@ can discover and read any gauge on the local network by name.
   calibration menu).
 - **Two pressure-conversion modes:** factory formula, or a field-editable
   piece-wise-linear (PWL) calibration table.
-- **Touchscreen calibration menu** (Waveshare AMOLED only) — tap the **CAL**
+- **Touchscreen calibration menu** (Waveshare boards) — tap the **CAL**
   button bottom-right of the gauge screen to set the cal mode, trim the zero
   offset, capture PWL cal points, or clear/restore the table, all without a
   serial connection.
@@ -56,6 +57,22 @@ can discover and read any gauge on the local network by name.
 | BOOT button | GPIO 0 — long-press (3 s) resets WiFi credentials             |
 
 QSPI wiring: CS=9, SCK=10, D0=11, D1=12, D2=13, D3=14, RST=21
+
+### Waveshare ESP32-S3-Touch-LCD-2 (`waveshare_touch_lcd_2`)
+
+| Component   | Detail                                                              |
+| ----------- | ------------------------------------------------------------------- |
+| MCU         | ESP32-S3R8, 16 MB Flash (QIO), 8 MB OPI PSRAM                      |
+| Display     | 240 × 320 ST7789T3 IPS, SPI (software-rotated to landscape)        |
+| Touch       | CST816D, I2C `0x15` — SDA = GPIO 48, SCL = GPIO 47, INT = GPIO 46  |
+| Sensor      | Posifa, I2C `0x50` — SDA = GPIO 48, SCL = GPIO 47 (shared bus)     |
+| Backlight   | GPIO 1 (active high)                                                |
+| BOOT button | GPIO 0 — long-press (3 s) resets WiFi credentials                  |
+
+SPI display wiring: DC=42, CS=45, SCK=39, MOSI=38, MISO=40, RST=none
+
+The CST816D touch controller and Posifa sensor share the same I2C bus; the
+firmware uses a FreeRTOS mutex to prevent bus contention.
 
 ### LILYGO T-QT Pro S3 (`lilygo_t_qt`)
 
@@ -191,7 +208,7 @@ commands are get/set pairs.
 4. Repeat at other pressures. Use `CALDUMP` to review, `CALCLEAR` to start
    over, `CALDEF` to restore the factory table.
 
-On the Waveshare board, the same workflow is available without a serial
+On the Waveshare boards, the same workflow is available without a serial
 connection: tap **CAL** on the gauge screen, **SET POINT**, dial in the
 reference pressure with the `±100`/`±10`/`±1`/`±.1`/`±.01` buttons, then
 **CAPTURE**. **CLEAR** and **DEFAULTS** are also available from that menu,
@@ -207,14 +224,23 @@ calibrated range are extrapolated along the nearest end segment.
 pioarduino ESP32 platform (required for ESP32 Arduino core v3).
 
 ```bash
-# Waveshare AMOLED (default)
+# Waveshare AMOLED 1.64
 pio run -e waveshare_amoled_164
 pio run -e waveshare_amoled_164 -t upload -t monitor
+
+# Waveshare Touch LCD 2
+pio run -e waveshare_touch_lcd_2
+pio run -e waveshare_touch_lcd_2 -t upload -t monitor
 
 # LILYGO T-QT Pro
 pio run -e lilygo_t_qt
 pio run -e lilygo_t_qt -t upload -t monitor
 ```
+
+The active board for the VS Code **Build** / **Upload** buttons is controlled
+by `default_envs` at the top of `platformio.ini`. Change the one line to
+switch boards, or use the environment picker in the VS Code PlatformIO status
+bar.
 
 `patch_libs.py` runs automatically before each build and patches
 `GAACE_Core/debug.cpp` for ESP32 Arduino core v3 API compatibility.
@@ -232,10 +258,10 @@ Shared by both environments:
 
 Environment-specific:
 
-| Library                             | Environment          | Purpose              |
-| ----------------------------------- | -------------------- | -------------------- |
-| moononournation/GFX Library for Arduino | waveshare_amoled_164 | CO5300 QSPI display |
-| Bodmer/TFT_eSPI                     | lilygo_t_qt          | GC9A01 TFT display   |
+| Library                                 | Environment                                          | Purpose                    |
+| --------------------------------------- | ---------------------------------------------------- | -------------------------- |
+| moononournation/GFX Library for Arduino | `waveshare_amoled_164`, `waveshare_touch_lcd_2`      | AMOLED / IPS SPI display   |
+| Bodmer/TFT_eSPI                         | `lilygo_t_qt`                                        | GC9A01 TFT display         |
 
 TFT_eSPI is configured by `include/User_Setup.h` (loaded automatically for the
 `lilygo_t_qt` build via `-DUSER_SETUP_LOADED`). Verify the pin numbers in that
@@ -245,7 +271,7 @@ file match your specific T-QT Pro S3 board if the display doesn't initialise.
 
 ```
 .
-├── platformio.ini          Two PlatformIO environments (waveshare_amoled_164, lilygo_t_qt)
+├── platformio.ini          Three PlatformIO environments (waveshare_amoled_164, waveshare_touch_lcd_2, lilygo_t_qt)
 ├── patch_libs.py           Pre-build library compatibility patch (GAACE_Core / core v3)
 ├── rename_firmware.py      Post-build firmware versioning / release copy
 ├── src/VacuumGauge.cpp     Application firmware (#ifdef for display sections only)

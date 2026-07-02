@@ -20,7 +20,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-#ifdef BOARD_WAVESHARE_AMOLED
+#ifdef BOARD_WAVESHARE
   #include <Arduino_GFX_Library.h>
 #else  // BOARD_LILYGO_TQT
   #include <SPI.h>
@@ -40,7 +40,7 @@
 // Board-specific pin definitions and screen dimensions
 // ---------------------------------------------------------------------------
 
-#ifdef BOARD_WAVESHARE_AMOLED
+#if defined(BOARD_WAVESHARE_AMOLED)
   // QSPI display (verified against GFX library Arduino_GFX_dev_device.h)
   static const int8_t  kQSPI_CS    = 9;
   static const int8_t  kQSPI_SCLK  = 10;
@@ -51,12 +51,27 @@
   static const int8_t  kQSPI_RST   = 21;
   static const int16_t kScreenW    = 456;   // landscape (software-rotated)
   static const int16_t kScreenH    = 280;
-  static const int     kI2C_SDA    = 1;
+  static const int     kI2C_SDA    = 1;    // Posifa sensor bus (Wire)
   static const int     kI2C_SCL    = 2;
-  // FT3168 capacitive touch — separate I2C bus from the Posifa sensor
+  // FT3168 touch on separate Wire1
   static const int     kTouchSDA   = 47;
   static const int     kTouchSCL   = 48;
   static const uint8_t kTouchAddr  = 0x38;
+#elif defined(BOARD_WAVESHARE_LCD2)
+  // SPI display: ST7789T3 240x320 IPS (RST=-1 per official Waveshare demo)
+  static const int8_t  kLCD_DC     = 42;
+  static const int8_t  kLCD_CS     = 45;
+  static const int8_t  kLCD_SCK    = 39;
+  static const int8_t  kLCD_MOSI   = 38;
+  static const int8_t  kLCD_MISO   = 40;
+  static const int8_t  kLCD_BL     = 1;
+  static const int16_t kScreenW    = 320;   // landscape (software-rotated)
+  static const int16_t kScreenH    = 240;
+  // Posifa sensor and CST816D touch share one I2C bus (different addresses)
+  static const int     kI2C_SDA    = 48;
+  static const int     kI2C_SCL    = 47;
+  static const uint8_t kTouchAddr  = 0x15;
+  static const int8_t  kTouchIntPin = 46;
 #else  // BOARD_LILYGO_TQT
   static const int16_t kScreenW    = 128;
   static const int16_t kScreenH    = 128;
@@ -156,7 +171,7 @@ Data lastSaved;
 enum AppState
 {
     STATE_PORTAL, STATE_CONNECTING, STATE_RUNNING
-#ifdef BOARD_WAVESHARE_AMOLED
+#ifdef BOARD_WAVESHARE
     , STATE_CAL_MENU, STATE_CAL_SETPOINT, STATE_CAL_CONFIRM
 #endif
 };
@@ -167,8 +182,7 @@ static AppState appState = STATE_PORTAL;
 // ---------------------------------------------------------------------------
 
 #ifdef BOARD_WAVESHARE_AMOLED
-  // CO5300 has no hardware transpose — portrait native mode only.
-  // Canvas rotation=1 remaps draw calls so flush() sends portrait-order pixels.
+  // CO5300 — QSPI, portrait-native; canvas rotation=1 gives landscape 456x280.
   static Arduino_DataBus *bus =
       new Arduino_ESP32QSPI(kQSPI_CS, kQSPI_SCLK, kQSPI_SDIO0,
                             kQSPI_SDIO1, kQSPI_SDIO2, kQSPI_SDIO3);
@@ -176,9 +190,21 @@ static AppState appState = STATE_PORTAL;
       bus, kQSPI_RST, 0, 280, 456, 20, 0, 180, 24);
   static Arduino_Canvas *canvas  = new Arduino_Canvas(280, 456, display, 0, 0, 1);
   static TwoWire         touchWire = TwoWire(1);
+#elif defined(BOARD_WAVESHARE_LCD2)
+  // ST7789T3 — SPI, IPS; rotation=1 gives landscape 320x240 in hardware.
+  // RST=-1 (no RST pin wired); official Waveshare demo confirms this.
+  // ST7789T3 — canvas rotation=1 gives landscape 320x240 (same pattern as AMOLED).
+  static Arduino_DataBus *bus =
+      new Arduino_ESP32SPI(kLCD_DC, kLCD_CS, kLCD_SCK, kLCD_MOSI, kLCD_MISO);
+  static Arduino_GFX    *display = new Arduino_ST7789(bus, -1, 0, true, 240, 320);
+  static Arduino_Canvas *canvas  = new Arduino_Canvas(240, 320, display, 0, 0, 1);
 #else  // BOARD_LILYGO_TQT
   static TFT_eSPI tft = TFT_eSPI();
   static Button   buttonB(kButtonB_Pin);
+#endif
+#ifdef BOARD_WAVESHARE
+  // Unified draw target — always the canvas (double-buffer) for both boards
+  static Arduino_GFX *screen = nullptr;
 #endif
 
 static AsyncWebServer server(80);
@@ -455,36 +481,58 @@ static void sensorTask(void *param)
 // Display
 // ---------------------------------------------------------------------------
 
-#ifdef BOARD_WAVESHARE_AMOLED
+#ifdef BOARD_WAVESHARE
 
 static void centerText(const char *str, int16_t y, uint8_t sz)
 {
-    canvas->setTextSize(sz);
+    screen->setTextSize(sz);
     int16_t  x1, y1;
     uint16_t w, h;
-    canvas->getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
-    canvas->setCursor((kScreenW - (int16_t)w) / 2 - x1, y);
-    canvas->print(str);
+    screen->getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+    screen->setCursor((kScreenW - (int16_t)w) / 2 - x1, y);
+    screen->print(str);
 }
 
 // ---------------------------------------------------------------------------
-// Touch (FT3168) — gauge calibration menu
+// Touch — gauge calibration menu
+// FT3168 (AMOLED, addr 0x38, Wire1) and CST816D (LCD2, addr 0x15, Wire)
+// share the same register protocol: reg 0x02 = finger count, 0x03-0x06 = X/Y.
+// Canvas rotation=1 (90° CW) means logical_x = raw_y,
+//   logical_y = (nativePanelWidth - 1) - raw_x.
 // ---------------------------------------------------------------------------
 
-static const uint8_t kFT3168_REG_TOUCHCOUNT = 0x02;  // + 0x03..0x06 = X1H,X1L,Y1H,Y1L
-
-// Native panel is portrait 280x456; canvas rotation=1 (90° CW) remaps draw
-// calls into the landscape 456x280 logical space used everywhere else in
-// this file. The touch IC reports points in that same native portrait
-// frame, so invert the rotation here: logical_x = raw_y, logical_y = 279 - raw_x.
 static bool readTouchPoint(int &lx, int &ly)
 {
+#ifdef BOARD_WAVESHARE_AMOLED
+    TwoWire &tw       = touchWire;
+    const int nativeW = 280;
+    // touchWire is a dedicated Wire1 — no mutex needed
+#else  // BOARD_WAVESHARE_LCD2: touch shares Wire with the sensor task
+    TwoWire &tw       = Wire;
+    const int nativeW = 240;
+    if (!xSemaphoreTake(wireMutex, 0)) return false;  // skip if bus is busy
+#endif
     uint8_t buf[5];
-    touchWire.beginTransmission(kTouchAddr);
-    touchWire.write(kFT3168_REG_TOUCHCOUNT);
-    if (touchWire.endTransmission(false) != 0) return false;
-    if (touchWire.requestFrom((int)kTouchAddr, 5) != 5) return false;
-    for (int i = 0; i < 5; i++) buf[i] = touchWire.read();
+    tw.beginTransmission(kTouchAddr);
+    tw.write(0x02);
+    if (tw.endTransmission(false) != 0)
+    {
+#ifdef BOARD_WAVESHARE_LCD2
+        xSemaphoreGive(wireMutex);
+#endif
+        return false;
+    }
+    if (tw.requestFrom((int)kTouchAddr, 5) != 5)
+    {
+#ifdef BOARD_WAVESHARE_LCD2
+        xSemaphoreGive(wireMutex);
+#endif
+        return false;
+    }
+    for (int i = 0; i < 5; i++) buf[i] = tw.read();
+#ifdef BOARD_WAVESHARE_LCD2
+    xSemaphoreGive(wireMutex);
+#endif
 
     uint8_t fingers = buf[0];
     if (fingers == 0 || fingers > 2) return false;
@@ -493,7 +541,7 @@ static bool readTouchPoint(int &lx, int &ly)
     int rawY = ((buf[3] & 0x0F) << 8) | buf[4];
 
     lx = rawY;
-    ly = 279 - rawX;
+    ly = (nativeW - 1) - rawX;
     return true;
 }
 
@@ -506,50 +554,65 @@ static bool hitButton(const UIButton &b, int tx, int ty)
 
 static void drawButton(const UIButton &b, const char *label, uint16_t color, uint8_t textSz)
 {
-    canvas->drawRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, color);
-    canvas->setTextColor(color);
-    canvas->setTextSize(textSz);
+    screen->drawRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, color);
+    screen->setTextColor(color);
+    screen->setTextSize(textSz);
     int16_t  x1, y1;
     uint16_t w, h;
-    canvas->getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
-    canvas->setCursor(b.x0 + ((b.x1 - b.x0) - (int16_t)w) / 2 - x1,
+    screen->getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
+    screen->setCursor(b.x0 + ((b.x1 - b.x0) - (int16_t)w) / 2 - x1,
                        b.y0 + ((b.y1 - b.y0) - (int16_t)h) / 2 - y1);
-    canvas->print(label);
+    screen->print(label);
 }
 
-// Main running screen
-static const UIButton kBtnCalOpen = { kScreenW - 48, kScreenH - 40, kScreenW - 4, kScreenH - 4 };
-
-// CAL_MENU screen
-static const UIButton kBtnExit    = { 416,  4, 452,  36 };
-static const UIButton kBtnMode    = {   8, 50, 150, 100 };
-static const UIButton kBtnOffDn   = { 160, 50, 302, 100 };
-static const UIButton kBtnOffUp   = { 312, 50, 454, 100 };
-static const UIButton kBtnSetPt   = {   8,110, 150, 160 };
-static const UIButton kBtnClear   = { 160,110, 302, 160 };
-static const UIButton kBtnDefault = { 312,110, 454, 160 };
-
-// CAL_SETPOINT screen
-static const int   kStepCols           = 5;
-static const float kStepVals[kStepCols] = { 100.0f, 10.0f, 1.0f, 0.1f, 0.01f };
+// Button layout — computed at runtime so the same code works at any kScreenW/kScreenH.
+static const int   kStepCols = 5;
+static const float kStepVals[kStepCols]        = { 100.0f, 10.0f, 1.0f, 0.1f, 0.01f };
 static const char *kStepPlusLabels[kStepCols]  = { "+100", "+10", "+1", "+.1", "+.01" };
 static const char *kStepMinusLabels[kStepCols] = { "-100", "-10", "-1", "-.1", "-.01" };
-static const UIButton kBtnPlus[kStepCols] =
-{
-    {  4, 95,  88,135}, { 94, 95, 178,135}, {184, 95, 268,135},
-    {274, 95, 358,135}, {364, 95, 448,135},
-};
-static const UIButton kBtnMinus[kStepCols] =
-{
-    {  4,140,  88,180}, { 94,140, 178,180}, {184,140, 268,180},
-    {274,140, 358,180}, {364,140, 448,180},
-};
-static const UIButton kBtnCapture = {  8,200, 224,260 };
-static const UIButton kBtnSetBack = {232,200, 448,260 };
 
-// CAL_CONFIRM screen
-static const UIButton kBtnYes = { 60,150, 200,210 };
-static const UIButton kBtnNo  = {256,150, 396,210 };
+static UIButton kBtnCalOpen;
+static UIButton kBtnExit;
+static UIButton kBtnMode,  kBtnOffDn,  kBtnOffUp;
+static UIButton kBtnSetPt, kBtnClear,  kBtnDefault;
+static UIButton kBtnPlus[kStepCols], kBtnMinus[kStepCols];
+static UIButton kBtnCapture, kBtnSetBack;
+static UIButton kBtnYes, kBtnNo;
+
+static void initCalButtons()
+{
+    const int16_t W   = kScreenW;
+    const int16_t H   = kScreenH;
+    const int16_t col = W / 3;
+
+    kBtnCalOpen = { (int16_t)(W - 48), (int16_t)(H - 40), (int16_t)(W - 4), (int16_t)(H - 4) };
+
+    kBtnExit    = { (int16_t)(W - 40), 4,   (int16_t)(W - 4), 36 };
+
+    kBtnMode    = { 4,                  50, (int16_t)(col - 2),        100 };
+    kBtnOffDn   = { col,                50, (int16_t)(2 * col - 2),    100 };
+    kBtnOffUp   = { (int16_t)(2*col),   50, (int16_t)(W - 4),          100 };
+
+    kBtnSetPt   = { 4,                 110, (int16_t)(col - 2),        160 };
+    kBtnClear   = { col,               110, (int16_t)(2 * col - 2),    160 };
+    kBtnDefault = { (int16_t)(2*col),  110, (int16_t)(W - 4),          160 };
+
+    const int16_t sw = (W - 8) / kStepCols;
+    for (int i = 0; i < kStepCols; i++)
+    {
+        int16_t x0 = (int16_t)(4 + i * sw);
+        int16_t x1 = (int16_t)(x0 + sw - 2);
+        kBtnPlus[i]  = { x0, 85,  x1, 130 };
+        kBtnMinus[i] = { x0, 135, x1, 180 };
+    }
+
+    int16_t capW = (W - 8) / 2;
+    kBtnCapture = { 4,                       (int16_t)(H - 50), (int16_t)(4 + capW),     (int16_t)(H - 4) };
+    kBtnSetBack = { (int16_t)(4 + capW + 4), (int16_t)(H - 50), (int16_t)(W - 4),        (int16_t)(H - 4) };
+
+    kBtnYes = { (int16_t)(W / 6),    150, (int16_t)(W * 2 / 5), (int16_t)(H - 30) };
+    kBtnNo  = { (int16_t)(W * 3 / 5),150, (int16_t)(W * 5 / 6), (int16_t)(H - 30) };
+}
 
 enum CalConfirmAction { CAL_CONFIRM_CLEAR, CAL_CONFIRM_DEFAULTS };
 static CalConfirmAction calConfirmAction = CAL_CONFIRM_CLEAR;
@@ -677,37 +740,37 @@ static void handleTouch()
 
 static void updateDisplay()
 {
-    canvas->fillScreen(C_BLACK);
-    canvas->setTextWrap(false);
+    screen->fillScreen(C_BLACK);
+    screen->setTextWrap(false);
 
     switch (appState)
     {
     case STATE_PORTAL:
-        canvas->setTextColor(C_YELLOW);
+        screen->setTextColor(C_YELLOW);
         centerText("VacuumGauge", kScreenH / 2 - 80, 3);
         centerText("Setup", kScreenH / 2 - 40, 3);
-        canvas->setTextColor(C_WHITE);
+        screen->setTextColor(C_WHITE);
         centerText("Connect to WiFi:", kScreenH / 2 + 10, 2);
-        canvas->setTextColor(C_CYAN);
+        screen->setTextColor(C_CYAN);
         centerText(kApSSID, kScreenH / 2 + 40, 2);
-        canvas->setTextColor(C_WHITE);
+        screen->setTextColor(C_WHITE);
         centerText("then browse to", kScreenH / 2 + 72, 1);
         centerText("192.168.4.1", kScreenH / 2 + 90, 2);
         break;
 
     case STATE_CONNECTING:
-        canvas->setTextColor(C_YELLOW);
+        screen->setTextColor(C_YELLOW);
         centerText("Connecting...", kScreenH / 2 - 30, 3);
-        canvas->setTextColor(C_WHITE);
+        screen->setTextColor(C_WHITE);
         centerText(data.ssid, kScreenH / 2 + 20, 2);
         break;
 
     case STATE_RUNNING:
     {
-        canvas->setTextColor(C_GREEN);
-        canvas->setTextSize(2);
-        canvas->setCursor(4, 4);
-        canvas->print(data.Name);
+        screen->setTextColor(C_GREEN);
+        screen->setTextSize(2);
+        screen->setCursor(4, 4);
+        screen->print(data.Name);
 
         float p;
         xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -720,18 +783,18 @@ static void updateDisplay()
         else if (p < 100.0f){ snprintf(pStr, sizeof(pStr), "%.1f", p);            unit = "Torr";  }
         else                 { snprintf(pStr, sizeof(pStr), "%.0f", p);            unit = "Torr";  }
 
-        canvas->setTextColor(C_WHITE);
+        screen->setTextColor(C_WHITE);
         centerText(pStr, kScreenH / 2 - 56, 6);
-        canvas->setTextColor(C_CYAN);
+        screen->setTextColor(C_CYAN);
         centerText(unit, kScreenH / 2 + 16, 4);
 
-        canvas->setTextColor(C_LGRAY);
-        canvas->setTextSize(2);
+        screen->setTextColor(C_LGRAY);
+        screen->setTextSize(2);
         String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "---";
-        canvas->setCursor(4, kScreenH - 40);
-        canvas->print("IP: "); canvas->print(ip);
-        canvas->setCursor(4, kScreenH - 20);
-        canvas->print("Cal: "); canvas->print(data.useCalTable ? "Table" : "Factory");
+        screen->setCursor(4, kScreenH - 40);
+        screen->print("IP: "); screen->print(ip);
+        screen->setCursor(4, kScreenH - 20);
+        screen->print("Cal: "); screen->print(data.useCalTable ? "Table" : "Factory");
 
         drawButton(kBtnCalOpen, "CAL", C_LGRAY, 1);
         break;
@@ -739,7 +802,7 @@ static void updateDisplay()
 
     case STATE_CAL_MENU:
     {
-        canvas->setTextColor(C_YELLOW);
+        screen->setTextColor(C_YELLOW);
         centerText("CALIBRATION", 4, 2);
         drawButton(kBtnExit, "X", C_WHITE, 2);
 
@@ -755,7 +818,7 @@ static void updateDisplay()
             snprintf(offStr, sizeof(offStr), "Offset: %+d Torr", data.offsetTorr);
         else
             snprintf(offStr, sizeof(offStr), "Offset: %+d mTorr", data.offsetmTorr);
-        canvas->setTextColor(C_LGRAY);
+        screen->setTextColor(C_LGRAY);
         centerText(offStr, 175, 2);
 
         char ptsStr[24];
@@ -766,17 +829,17 @@ static void updateDisplay()
 
     case STATE_CAL_SETPOINT:
     {
-        canvas->setTextColor(C_YELLOW);
+        screen->setTextColor(C_YELLOW);
         centerText("SET CAL POINT", 4, 2);
 
         char rawStr[24];
         snprintf(rawStr, sizeof(rawStr), "Raw: %d", data.rawData);
-        canvas->setTextColor(C_LGRAY);
+        screen->setTextColor(C_LGRAY);
         centerText(rawStr, 28, 2);
 
         char valStr[24];
         snprintf(valStr, sizeof(valStr), "%.2f Torr", calSetpointTorr);
-        canvas->setTextColor(C_WHITE);
+        screen->setTextColor(C_WHITE);
         centerText(valStr, 55, 3);
 
         for (int i = 0; i < kStepCols; i++)
@@ -790,7 +853,7 @@ static void updateDisplay()
     }
 
     case STATE_CAL_CONFIRM:
-        canvas->setTextColor(C_YELLOW);
+        screen->setTextColor(C_YELLOW);
         centerText(calConfirmAction == CAL_CONFIRM_CLEAR ? "Clear cal table?" : "Restore factory defaults?", 80, 2);
         drawButton(kBtnYes, "YES", C_GREEN, 2);
         drawButton(kBtnNo,  "NO",  C_WHITE, 2);
@@ -1425,15 +1488,27 @@ void setup()
     pinMode(kBootPin, INPUT_PULLUP);
 
 #ifdef BOARD_WAVESHARE_AMOLED
-    if (!canvas->begin())
+    screen = canvas;
+    if (!screen->begin())
         Serial.println("Display init failed — check QSPI wiring");
-    canvas->fillScreen(C_BLACK);
+    screen->fillScreen(C_BLACK);
     canvas->flush();
+    initCalButtons();
     touchWire.begin(kTouchSDA, kTouchSCL, kI2C_Hz);
     touchWire.beginTransmission(kTouchAddr);
     touchWire.write((uint8_t)0x00);  // device mode register
-    touchWire.write((uint8_t)0x00);  // 0x00 = normal operating mode
+    touchWire.write((uint8_t)0x00);  // normal operating mode
     touchWire.endTransmission();
+#elif defined(BOARD_WAVESHARE_LCD2)
+    screen = canvas;
+    if (!screen->begin())
+        Serial.println("Display init failed — check SPI wiring");
+    screen->fillScreen(C_BLACK);
+    canvas->flush();
+    pinMode(kLCD_BL, OUTPUT);
+    digitalWrite(kLCD_BL, HIGH);
+    initCalButtons();
+    // CST816D shares Wire (started above); no extra init needed
 #else  // BOARD_LILYGO_TQT
     pinMode(kTFT_BL, OUTPUT);
     digitalWrite(kTFT_BL, HIGH);
@@ -1534,14 +1609,14 @@ void loop()
     // Display refresh
     unsigned long now = millis();
     bool forceRedraw = false;
-#ifdef BOARD_WAVESHARE_AMOLED
+#ifdef BOARD_WAVESHARE
     handleTouch();
     forceRedraw = needsRedraw;
 #endif
     if (now - lastDisplayMs >= 500 || forceRedraw)
     {
         lastDisplayMs = now;
-#ifdef BOARD_WAVESHARE_AMOLED
+#ifdef BOARD_WAVESHARE
         needsRedraw = false;
 #endif
         updateDisplay();
