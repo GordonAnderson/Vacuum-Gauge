@@ -15,6 +15,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
@@ -213,7 +214,11 @@ static WiFiUDP        discoveryUdp;
 
 static const uint16_t kDiscoveryPort = 6969;
 static const char    *kDiscoverMsg   = "GAACE-DISCOVER";
+static const uint16_t kTcpPort       = 23;   // raw GAACE ASCII command port (advertised via discovery)
 static const uint16_t kServicePort   = 80;   // HTTP REST API port — see setupServer()
+
+static WiFiServer tcpServer(kTcpPort);
+static WiFiClient tcpClient;
 
 commandProcessor cp;
 debug            dbg(&cp);
@@ -975,7 +980,7 @@ static void handleDiscovery()
              "TYPE,vacuum_gauge\n"
              "VERSION,%s\n"
              "PORT,%u\n",
-             data.Name, FIRMWARE_VERSION, kServicePort);
+             data.Name, FIRMWARE_VERSION, kTcpPort);
 
     discoveryUdp.beginPacket(remoteIp, remotePort);
     discoveryUdp.write((const uint8_t *)reply, strlen(reply));
@@ -1519,6 +1524,7 @@ void setup()
 #endif
 
     cp.registerStream(&Serial);
+    cp.registerStream(&tcpClient);
     cp.registerCommands(&cmdList);
     cp.registerCommands(dbg.debugCommands());
     dbg.registerDebugFunction(Debug);
@@ -1558,6 +1564,7 @@ void loop()
             Serial.print("Connected, IP: ");
             Serial.println(WiFi.localIP());
             discoveryUdp.begin(kDiscoveryPort);
+            tcpServer.begin();
         }
         else if (millis() - connectStartMs > 30000)
         {
@@ -1567,7 +1574,19 @@ void loop()
     }
 
     if (appState == STATE_RUNNING)
+    {
         handleDiscovery();
+
+        if (!tcpClient || !tcpClient.connected())
+        {
+            WiFiClient newClient = tcpServer.accept();
+            if (newClient)
+            {
+                tcpClient = newClient;
+                Serial.println("TCP client connected");
+            }
+        }
+    }
 
     // Boot button: long-press clears WiFi and reboots; on T-QT short-press trims offset up
     bool bootDown = (digitalRead(kBootPin) == LOW);
