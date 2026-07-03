@@ -84,6 +84,24 @@ firmware uses a FreeRTOS mutex to prevent bus contention.
 | Button A     | GPIO 0 — short-press trims offset up; long-press (3 s) resets WiFi |
 | Button B     | GPIO 47 — short-press trims offset down                       |
 
+## Selecting the target board
+
+Before building or uploading, set the active board in `platformio.ini` by
+editing the `default_envs` line near the top of the file:
+
+```ini
+; Pick exactly one:
+default_envs = waveshare_amoled_164    ; Waveshare ESP32-S3-Touch-AMOLED-1.64
+default_envs = waveshare_touch_lcd_2   ; Waveshare ESP32-S3-Touch-LCD-2
+default_envs = lilygo_t_qt             ; LILYGO T-QT Pro S3
+```
+
+Comment out the two you are not using, or use the **PlatformIO environment
+picker** in the VS Code status bar (click the environment name at the bottom of
+the window) to switch boards without editing the file. The PlatformIO sidebar
+(alien-head icon → Project Tasks) also lets you Build / Upload / Monitor each
+environment independently without changing `default_envs` at all.
+
 ## First-boot setup
 
 1. Power on the gauge. It starts a WiFi access point named **VacuumGauge-Setup**.
@@ -282,6 +300,45 @@ file match your specific T-QT Pro S3 board if the display doesn't initialise.
 │   └── build_info.h        Auto-generated build timestamp (do not edit)
 └── releases/               Versioned .bin files safe to commit
 ```
+
+## Roadmap
+
+Planned features and integrations — not yet implemented.
+
+### Pressure switch output
+
+A configurable digital output that toggles state when the measured pressure
+crosses a user-defined setpoint. Planned behaviour:
+
+- Set point and hysteresis band configurable via serial commands and (on
+  Waveshare boards) the touchscreen calibration menu.
+- Output pin configurable per board; active-high or active-low selectable.
+- State visible on the gauge screen and in the REST API `/status` response.
+- NVS-persisted so the switch survives power cycles without reconfiguration.
+
+### PWM analog output
+
+A PWM output proportional to the measured pressure, intended to drive a
+downstream analog input (DAC-filtered or read directly):
+
+- Pressure-to-duty-cycle mapping configurable (min pressure → 0 %, max
+  pressure → 100 %, or user-defined span).
+- Frequency and output pin selectable per build.
+- Useful for interfacing with PLCs, chart recorders, or analog control loops
+  that do not support I2C or TCP.
+
+### Automatic pressure control valve
+
+A companion GAA-CE product — a motorized valve controller that works with this
+gauge to form a closed-loop pressure regulator:
+
+- The gauge reports pressure over the GAACE TCP command interface (port 23);
+  the valve controller reads `GPRES` and adjusts valve position to reach a
+  target setpoint.
+- Target setpoint, PID tuning, and valve limits configurable from the MIPS
+  desktop application.
+- The gauge firmware will expose additional commands (`?SETPRESS`, `?VALVEMODE`)
+  to support coordinated operation once the valve hardware is defined.
 
 ## License
 
