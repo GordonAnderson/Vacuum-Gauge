@@ -321,12 +321,6 @@ crosses a user-defined setpoint. Planned behaviour:
 A PWM output proportional to the measured pressure, intended to drive a
 downstream analog input (DAC-filtered or read directly):
 
-- Pressure-to-duty-cycle mapping configurable (min pressure → 0 %, max
-  pressure → 100 %, or user-defined span).
-- Frequency and output pin selectable per build.
-- Useful for interfacing with PLCs, chart recorders, or analog control loops
-  that do not support I2C or TCP.
-
 ### Automatic pressure control valve
 
 A companion GAA-CE product — a motorized valve controller that works with this
