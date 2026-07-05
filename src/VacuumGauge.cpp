@@ -951,6 +951,7 @@ static void startSTA()
 {
     dnsServer.stop();
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);  // disable modem-sleep power save; it adds ~100-300ms of latency to inbound packets
     WiFi.begin(data.ssid, data.pass);
     connectStartMs = millis();
     appState = STATE_CONNECTING;
@@ -1583,6 +1584,7 @@ void loop()
             if (newClient)
             {
                 tcpClient = newClient;
+                tcpClient.setNoDelay(true);  // disable Nagle so small command replies aren't coalesced/delayed
                 Serial.println("TCP client connected");
             }
         }
